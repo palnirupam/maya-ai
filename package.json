@@ -1,0 +1,16 @@
+{
+  "name": "maya-ai-root",
+  "version": "1.0.0",
+  "description": "Root package for Maya AI to run frontend and backend concurrently",
+  "scripts": {
+    "install:all": "npm install && cd frontend && npm install && cd ../backend && .\\.venv\\Scripts\\activate.bat && pip install -r requirements.txt",
+    "prestart": "backend\\.venv\\Scripts\\python.exe scratch\\kill_everything.py",
+    "start": "concurrently -c \"cyan,magenta\" -n \"backend,frontend\" \"backend\\.venv\\Scripts\\python.exe -m uvicorn backend.api.main:app --host 127.0.0.1 --port 8000\" \"cd frontend && npm run dev\"",
+    "start:backend": "backend\\.venv\\Scripts\\python.exe -m uvicorn backend.api.main:app --host 127.0.0.1 --port 8000",
+    "start:frontend": "cd frontend && npm run dev",
+    "start:voice": "node scripts/start_voice.js"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

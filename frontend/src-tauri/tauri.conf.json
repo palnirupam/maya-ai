@@ -1,0 +1,28 @@
+{
+  "productName": "Maya AI",
+  "version": "1.0.0",
+  "identifier": "com.mayaai.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devPath": "http://localhost:1420",
+    "distDir": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Maya AI",
+        "width": 1200,
+        "height": 800,
+        "decorations": false,
+        "transparent": true,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  }
+}

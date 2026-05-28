@@ -1,0 +1,101 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+backend/.venv/
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+package-lock.json
+
+# Environment Variables
+.env
+.env.local
+
+# Build / Output
+dist/
+build/
+*.egg-info/
+scratch/
+
+# Database & Data
+data/
+*.db
+*.sqlite3
+
+# Logs
+logs/
+*.log
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+backend/.venv/
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+package-lock.json
+
+# Environment Variables
+.env
+.env.local
+
+# Build / Output
+dist/
+build/
+*.egg-info/
+scratch/
+
+# Database & Data
+data/
+*.db
+*.sqlite3
+
+# Logs
+logs/
+*.log
+
+# WhatsApp Service
+.wwebjs_auth/
+.wwebjs_cache/
+whatsapp_auth/
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Maya Runtime Data & Privacy
+backend/data/browser_state.json
+backend/data/screenshots/
+backend/data/youtube_player.pid
+
+
+# Other
+maya_reference.mp3
+test_*.mp3
+transcript.txt
+voices.txt
+*.exe
+*.bin
+*.pth
+backend/voice/gpt_sovits_core/GPT_SoVITS/pretrained_models/

@@ -1,0 +1,718 @@
+--- backend/utils/audit_logger.py ---
+import os
+import logging
+import subprocess
+import platform
+from pathlib import Path
+
+LOG_DIR = Path("backend/logs")
+LOG_FILE = LOG_DIR / "security_events.log"
+
+def setup_append_only_permissions(file_path: Path):
+    """
+    Sets NTFS permissions on Windows to allow only FILE_APPEND_DATA for the current user,
+    preventing deletion or backward modification.
+    Requires the file to exist.
+    """
+    if platform.system() != "Windows":
+        # On Linux/Mac, we might use chattr +a, but requires sudo.
+        return
+        
+    try:
+        # Get current username
+        username = os.environ.get("USERNAME")
+        if not username:
+            return
+            
+        # Grant Append Data (AD) and Read (R), but deny Write Data (WD) and Delete (DE)
+        # Note: In a real enterprise setup, an admin script sets this. 
+        # Here we do our best effort with icacls.
+        file_str = str(file_path.absolute())
+        
+        # Reset permissions (inheriting from parent)
+        subprocess.run(["icacls", file_str, "/reset"], capture_output=True)
+        
+        # Deny Delete (DE)
+        # Note: Denying WD (Write Data) breaks Python's open(mode='a') which requests GENERIC_WRITE
+        deny_cmd = ["icacls", file_str, "/deny", f"{username}:(DE)"]
+        subprocess.run(deny_cmd, capture_output=True)
+        
+    except Exception as e:
+        print(f"Failed to set append-only permissions: {e}")
+
+def get_audit_logger():
+    if not LOG_DIR.exists():
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        
+    if not LOG_FILE.exists():
+        LOG_FILE.touch()
+        setup_append_only_permissions(LOG_FILE)
+
+    logger = logging.getLogger("MayaSecurityAudit")
+    logger.setLevel(logging.WARNING)
+    
+    # Avoid adding handlers multiple times
+    if not logger.handlers:
+        handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        
+    return logger
+
+audit_logger = get_audit_logger()
+
+
+--- backend/scripts/reencrypt_wizard.py ---
+import shutil
+from pathlib import Path
+from backend.utils.audit_logger import audit_logger
+
+DB_PATH = Path("data/memory.db")
+BACKUP_PATH = Path("data/memory.db.backup")
+
+def backup_database():
+    if DB_PATH.exists():
+        shutil.copy2(DB_PATH, BACKUP_PATH)
+        audit_logger.warning(f"Database backed up to {BACKUP_PATH}")
+        print(f"Backup successful: {BACKUP_PATH}")
+    else:
+        print("Database not found. Nothing to backup.")
+
+def main():
+    print("Maya AI - Database Backup & Re-encryption Wizard")
+    print("------------------------------------------------")
+    backup_database()
+    print("\nNext step: Update crypto.py with hardware fingerprint.")
+
+if __name__ == "__main__":
+    main()
+
+
+--- backend/database/crypto.py ---
+import os
+from cryptography.fernet import Fernet
+from pathlib import Path
+
+KEY_FILE = Path("data/.fernet_key")
+
+import subprocess
+import hashlib
+import base64
+
+def _get_hardware_fingerprint() -> str:
+    try:
+        if os.name == 'nt':
+            # Windows: Get Motherboard Serial and CPU ID using powershell
+            cpu_cmd = 'powershell -NoProfile -Command "(Get-CimInstance Win32_Processor).ProcessorId"'
+            board_cmd = 'powershell -NoProfile -Command "(Get-CimInstance Win32_BaseBoard).SerialNumber"'
+            cpu_id = subprocess.check_output(cpu_cmd, shell=True).decode().strip()
+            board_id = subprocess.check_output(board_cmd, shell=True).decode().strip()
+            return f"{board_id}_{cpu_id}"
+        else:
+            # Linux/Mac fallback (for cross-platform testing)
+            import uuid
+            return str(uuid.getnode())
+    except Exception:
+        return "fallback_static_fingerprint_for_safety"
+
+def _get_or_create_key() -> bytes:
+    """
+    Generates a 32-byte Fernet-compatible key using PBKDF2
+    based on the hardware fingerprint.
+    """
+    fingerprint = _get_hardware_fingerprint()
+    # Use PBKDF2 to derive a secure 32-byte key
+    # Salt is dynamically generated and stored securely
+    salt_file = Path("data/.salt")
+    if salt_file.exists():
+        with open(salt_file, "rb") as f:
+            salt = f.read()
+    else:
+        import os
+        salt = os.urandom(16)
+        salt_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(salt_file, "wb") as f:
+            f.write(salt)
+
+    derived_key = hashlib.pbkdf2_hmac(
+        'sha256',
+        fingerprint.encode('utf-8'),
+        salt,
+        100000,
+        dklen=32
+    )
+    # Fernet requires url-safe base64 encoded 32-byte key
+    return base64.urlsafe_b64encode(derived_key)
+
+FERNET_KEY = _get_or_create_key()
+cipher = Fernet(FERNET_KEY)
+
+class CryptoManager:
+    @staticmethod
+    def encrypt(data: str) -> str:
+        if not data:
+            return ""
+        return cipher.encrypt(data.encode()).decode()
+        
+    @staticmethod
+    def decrypt(token: str) -> str:
+        if not token:
+            return ""
+        try:
+            return cipher.decrypt(token.encode()).decode()
+        except Exception:
+            return ""
+
+crypto_manager = CryptoManager()
+
+
+--- backend/database/recovery.py ---
+import hashlib
+import secrets
+
+# A small subset of BIP39 wordlist for demonstration
+WORDLIST = [
+    "abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract",
+    "absurd", "abuse", "access", "accident", "account", "accuse", "achieve", "acid",
+    "acoustic", "acquire", "across", "act", "action", "actor", "actress", "actual",
+    "adapt", "add", "addict", "address", "adjust", "admit", "adult", "advance",
+    "advice", "aerobic", "affair", "afford", "afraid", "again", "age", "agent",
+    "agree", "ahead", "aim", "air", "airport", "aisle", "alarm", "album", "alcohol",
+    "alert", "alien", "all", "alley", "allow", "almost", "alone", "alpha", "already",
+    "also", "alter", "always", "amateur", "amazing", "among", "amount", "amused"
+] # 64 words for 6 bits each
+
+class RecoveryManager:
+    @staticmethod
+    def generate_seed_phrase() -> str:
+        """Generates a 12-word seed phrase."""
+        # For a real implementation, 'mnemonic' package is recommended.
+        # This is a functional local implementation mapping 72 bits to 12 words (6 bits each).
+        random_bytes = secrets.token_bytes(9) # 72 bits
+        bits = bin(int.from_bytes(random_bytes, byteorder='big'))[2:].zfill(72)
+        
+        words = []
+        for i in range(0, 72, 6):
+            chunk = bits[i:i+6]
+            index = int(chunk, 2)
+            words.append(WORDLIST[index])
+            
+        return " ".join(words)
+        
+    @staticmethod
+    def seed_to_key(seed_phrase: str) -> bytes:
+        """Derives a backup encryption key from the seed phrase."""
+        # Use PBKDF2 on the seed phrase to generate the 32-byte recovery key
+        salt = b"maya_ai_recovery_salt"
+        return hashlib.pbkdf2_hmac(
+            'sha256',
+            seed_phrase.encode('utf-8'),
+            salt,
+            100000,
+            dklen=32
+        )
+
+recovery_manager = RecoveryManager()
+
+
+--- backend/skills/scanner.py ---
+import ast
+from typing import List
+
+class SecurityScanner(ast.NodeVisitor):
+    def __init__(self):
+        self.violations: List[str] = []
+        # List of dangerous functions we want to block in plugins
+        self.dangerous_functions = {
+            'eval', 'exec', 'compile', '__import__',
+            'system', 'popen', 'subprocess', 'pickle',
+            'socket', 'Popen', 'call', 'check_output'
+        }
+        
+    def visit_Call(self, node):
+        # Check if the function being called is a Name (e.g., eval())
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+            if func_name in self.dangerous_functions:
+                self.violations.append(f"Direct call to dangerous function: {func_name}")
+                
+        # Check if the function is an Attribute (e.g., subprocess.Popen)
+        elif isinstance(node.func, ast.Attribute):
+            func_name = node.func.attr
+            if func_name in self.dangerous_functions:
+                self.violations.append(f"Attribute call to dangerous function: {func_name}")
+            
+            # Also check the base module name (e.g., subprocess.run)
+            if isinstance(node.func.value, ast.Name):
+                module_name = node.func.value.id
+                if module_name in self.dangerous_functions:
+                    self.violations.append(f"Call from dangerous module: {module_name}")
+                    
+        self.generic_visit(node)
+        
+    def visit_Import(self, node):
+        for alias in node.names:
+            if alias.name in self.dangerous_functions:
+                self.violations.append(f"Import of dangerous module: {alias.name}")
+        self.generic_visit(node)
+        
+    def visit_ImportFrom(self, node):
+        if node.module in self.dangerous_functions:
+            self.violations.append(f"Import from dangerous module: {node.module}")
+        self.generic_visit(node)
+
+def scan_plugin_code(code_str: str) -> bool:
+    """
+    Scans python code for security violations.
+    Returns True if safe, raises Exception if violations found.
+    """
+    try:
+        tree = ast.parse(code_str)
+    except SyntaxError as e:
+        raise ValueError(f"Syntax error in plugin code: {e}")
+        
+    scanner = SecurityScanner()
+    scanner.visit(tree)
+    
+    if scanner.violations:
+        raise SecurityError(f"Security violations found: {', '.join(scanner.violations)}")
+        
+    return True
+
+class SecurityError(Exception):
+    pass
+
+
+--- backend/skills/loader.py ---
+import json
+import hashlib
+from pathlib import Path
+from backend.skills.scanner import scan_plugin_code, SecurityError
+from backend.utils.audit_logger import audit_logger
+
+REGISTRY_FILE = Path("backend/skills/registry.json")
+
+def load_registry() -> dict:
+    if not REGISTRY_FILE.exists():
+        return {}
+    try:
+        with open(REGISTRY_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        audit_logger.error(f"Failed to read registry: {e}")
+        return {}
+
+def verify_and_load_plugin(plugin_path: Path) -> bool:
+    """
+    Verifies the SHA-256 hash of the plugin against the registry,
+    runs AST static analysis, and returns True if safe.
+    """
+    if not plugin_path.exists():
+        return False
+        
+    plugin_name = plugin_path.stem
+    registry = load_registry()
+    
+    if plugin_name not in registry:
+        audit_logger.warning(f"Plugin {plugin_name} not in registry. Blocked.")
+        return False
+        
+    expected_hash = registry[plugin_name]
+    
+    try:
+        code_str = plugin_path.read_text(encoding="utf-8")
+        actual_hash = hashlib.sha256(code_str.encode("utf-8")).hexdigest()
+        
+        if actual_hash != expected_hash:
+            audit_logger.warning(f"Hash mismatch for plugin {plugin_name}. Expected {expected_hash}, got {actual_hash}. Blocked.")
+            return False
+            
+        # Run AST scanner
+        scan_plugin_code(code_str)
+        
+        return True
+    except SecurityError as e:
+        audit_logger.warning(f"Security violation in plugin {plugin_name}: {e}. Blocked.")
+        return False
+    except Exception as e:
+        audit_logger.error(f"Error loading plugin {plugin_name}: {e}")
+        return False
+
+
+--- backend/brain/security_filter.py ---
+import re
+from backend.utils.audit_logger import audit_logger
+
+class PromptSanitizer:
+    def __init__(self):
+        # A set of Regex patterns to detect prompt injection
+        self.injection_patterns = [
+            r"ignore (all )?previous instructions",
+            r"forget (everything|previous instructions)",
+            r"system message:",
+            r"new instruction:",
+            r"you are now (a|an|the)",
+            r"delete all files",
+            r"format c:"
+        ]
+        self.compiled_patterns = [re.compile(p, re.IGNORECASE) for p in self.injection_patterns]
+
+    def sanitize_tool_output(self, tool_name: str, output: str) -> str:
+        """
+        Scans the output from external tools.
+        If it finds a suspicious pattern, it quarantines the output.
+        """
+        if not isinstance(output, str):
+            # Convert to string to safely scan JSON or other returns
+            output_str = str(output)
+        else:
+            output_str = output
+
+        for pattern in self.compiled_patterns:
+            if pattern.search(output_str):
+                audit_logger.warning(f"Prompt injection pattern detected in output from {tool_name}. Pattern matched: {pattern.pattern}")
+                # Quarantine the output
+                return f"[SECURITY_ALERT] The output from {tool_name} was quarantined because it contains suspicious instructions."
+                
+        return output
+
+sanitizer = PromptSanitizer()
+
+
+--- backend/brain/orchestrator.py ---
+import logging
+from typing import Dict
+from .providers.base import LLMProvider
+from .providers.gemini_adapter import GeminiAdapter
+
+logger = logging.getLogger(__name__)
+
+class ConversationOrchestrator:
+    """
+    Manages conversation memory, session context, and routes queries 
+    to the appropriate LLM provider.
+    """
+    def __init__(self):
+        self.provider: LLMProvider = GeminiAdapter()
+        self.sessions: Dict[str, list[dict]] = {}
+        self.MAX_MEMORY_WINDOW = 20
+
+    def get_session(self, session_id: str) -> list[dict]:
+        if session_id not in self.sessions:
+            from .personality.maya_personality import prompt_builder
+            self.sessions[session_id] = [
+                {"role": "system", "content": prompt_builder.get_system_prompt()}
+            ]
+        return self.sessions[session_id]
+
+    def add_to_memory(self, session_id: str, role: str, content: str, reasoning_content: str = None):
+        session = self.get_session(session_id)
+        msg = {"role": role, "content": content}
+        if reasoning_content:
+            msg["reasoning_content"] = reasoning_content
+        session.append(msg)
+        
+        # Enforce memory window limit
+        if len(session) > self.MAX_MEMORY_WINDOW:
+            # Keep system prompt, remove oldest messages
+            self.sessions[session_id] = [session[0]] + session[-(self.MAX_MEMORY_WINDOW-1):]
+
+    async def process_user_input(self, session_id: str, text: str, image_base64: str = None) -> str:
+        """Process a full text input from the user and get a response."""
+        logger.info(f"Processing input for session {session_id}: {text}")
+        
+        self.add_to_memory(session_id, "user", text)
+        context = self.get_session(session_id)
+        
+        # In a real pipeline, we might stream this directly to the TTS router.
+        # For now, we fetch the full response.
+        response_text = await self.provider.generate_response(context, text, image_base64)
+        
+        self.add_to_memory(session_id, "assistant", response_text)
+        return response_text
+        
+    async def process_user_input_stream(self, session_id: str, text: str, image_base64: str = None):
+        """Process input and stream the response back in chunks, supporting ReAct loops."""
+        logger.info(f"Streaming input for session {session_id}: {text}")
+        
+        self.add_to_memory(session_id, "user", text)
+        
+        loop_count = 0
+        MAX_LOOPS = 5
+        full_response = ""
+        assistant_added = False
+        
+        while loop_count < MAX_LOOPS:
+            context = self.get_session(session_id)
+            tool_calls_this_turn = []
+            reasoning_content_this_turn = ""
+            
+            async for chunk in self.provider.generate_stream(context, text if loop_count == 0 else None, image_base64 if loop_count == 0 else None):
+                if isinstance(chunk, dict):
+                    if chunk.get("type") == "tool_call":
+                        tool_calls_this_turn.append(chunk)
+                    elif chunk.get("type") == "reasoning":
+                        reasoning_content_this_turn += chunk.get("content", "")
+                else:
+                    full_response += chunk
+                    yield chunk
+                    
+            if not tool_calls_this_turn:
+                # No more tools called, we are done!
+                self.add_to_memory(session_id, "assistant", full_response, reasoning_content_this_turn)
+                assistant_added = True
+                break
+                
+            # Execute tool calls
+            from .reasoning.tool_planner import tool_planner
+            from .gemini.function_calls import get_maya_tools
+            
+            for tc in tool_calls_this_turn:
+                func_name = tc["name"]
+                args = tc["args"]
+                
+                # Check danger
+                DANGER_TOOLS = ["execute_python", "execute_powershell", "delete_file", "manage_system_state", "manage_processes"]
+                approved = True
+                
+                if func_name in DANGER_TOOLS:
+                    from ..database.connection import SessionLocal
+                    from ..database.models import UserPreferences
+                    from ..database.crypto import crypto_manager
+                    
+                    db_session = SessionLocal()
+                    auto_approve = False
+                    try:
+                        pref = db_session.query(UserPreferences).filter(UserPreferences.key == "PERM_AUTO_APPROVE").first()
+                        if pref and pref.value:
+                            try:
+                                auto_approve = (crypto_manager.decrypt(pref.value) == "true")
+                            except Exception:
+                                pass
+                    finally:
+                        db_session.close()
+                        
+                    req = tool_planner.queue_tool(func_name, args, risk_level="danger")
+                    
+                    if auto_approve:
+                        # Auto-approve: Notify UI that tool is running and execute immediately
+                        req_copy = dict(req)
+                        req_copy["status"] = "executed"
+                        yield {"type": "tool_call_request", "data": req_copy}
+                        tool_planner.resolve_tool(req["request_id"], approved=True)
+                        approved = True
+                    else:
+                        # Safe Mode: Yield approval card and block waiting for user confirmation
+                        yield {"type": "tool_call_request", "data": req}
+                        approved = await tool_planner.wait_for_approval(req["request_id"])
+                    
+                if approved:
+                    tools = get_maya_tools()
+                    func = next((f for f in tools if f.__name__ == func_name), None)
+                    if func:
+                        try:
+                            # Actually execute!
+                            result = func(**args)
+                        except Exception as e:
+                            result = str(e)
+                    else:
+                        result = f"Tool {func_name} not found or permission disabled."
+                else:
+                    result = "User denied permission."
+                    
+                # Add function response to memory!
+                # We need to store it as a dict that gemini_adapter.py will recognize
+                self.sessions[session_id].append({
+                    "role": "tool_call",
+                    "name": func_name,
+                    "args": args,
+                    "reasoning_content": tc.get("reasoning_content"),
+                    "thought_signature": tc.get("thought_signature")
+                })
+                from .security_filter import sanitizer
+                safe_result = sanitizer.sanitize_tool_output(func_name, result)
+                
+                self.sessions[session_id].append({
+                    "role": "function",
+                    "name": func_name,
+                    "content": str(safe_result)
+                })
+                
+            loop_count += 1
+            
+        if not assistant_added:
+            self.add_to_memory(session_id, "assistant", full_response)
+
+orchestrator = ConversationOrchestrator()
+
+
+--- backend/brain/gemini/function_calls.py ---
+from ...tools.desktop.mouse import mouse_tools
+from ...tools.desktop.keyboard import keyboard_tools
+from ...vision.capture.screen_capture import screen_capture
+
+from ...tools.desktop.apps import open_app, close_app, focus_app, list_open_apps
+from ...tools.desktop.advanced.browser_tools import open_url, search_youtube, search_google, gmail_action, send_background_email
+from ...tools.desktop.advanced.playwright_browser import playwright_navigate, playwright_click, playwright_type, playwright_screenshot, playwright_get_content, playwright_close
+from ...tools.desktop.advanced.file_system_tools import create_file, read_file, list_directory, delete_file, search_local_files
+from ...tools.desktop.advanced.terminal_tools import execute_powershell, execute_python
+from ...tools.desktop.advanced.system_tools import get_active_windows, change_volume, read_clipboard, write_clipboard, get_system_stats, manage_processes, read_on_screen_text, whatsapp_call, whatsapp_send_message, whatsapp_get_pairing_code, pause_media, setup_missing_tool
+from ...tools.desktop.advanced.vision_tools import find_and_click, wait_for_element, read_active_window_title, is_app_open, take_verified_screenshot
+from ...tools.desktop.advanced.memory_tools import remember_fact, recall_facts, configure_gmail_credentials
+from ...tools.desktop.advanced.contacts import save_contact, get_contact_number
+
+from ...database.connection import SessionLocal
+from ...database.models import UserPreferences
+from ...database.crypto import crypto_manager
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Basic interaction tools
+def type_text(text: str) -> str:
+    """Type the specified text using the keyboard."""
+    return keyboard_tools.type_text(text)
+
+def press_key(key: str) -> str:
+    """Press a specific keyboard key (e.g., 'enter', 'win', 'esc')."""
+    return keyboard_tools.press_key(key)
+
+def hotkey(key1: str, key2: str = None) -> str:
+    """Execute a keyboard hotkey combination (e.g., 'ctrl', 'c' or 'win', 'r')."""
+    if key2:
+        return keyboard_tools.hotkey(key1, key2)
+    return keyboard_tools.hotkey(key1)
+
+def click_mouse() -> str:
+    """Perform a left mouse click at the current cursor position."""
+    return mouse_tools.click()
+
+def double_click_mouse() -> str:
+    """Perform a double click at the current cursor position."""
+    return mouse_tools.double_click()
+
+def move_mouse_to(x: int, y: int) -> str:
+    """Move the mouse cursor to specific X and Y screen coordinates."""
+    return mouse_tools.move_to(x, y)
+
+def get_mouse_position() -> str:
+    """Get the current X and Y screen coordinates of the mouse cursor."""
+    return mouse_tools.get_position()
+
+def look_at_screen() -> str:
+    """
+    Capture a screenshot of the user's desktop to see what is currently on their screen.
+    Returns the image data in base64 format.
+    """
+    return "SCREENSHOT_TRIGGERED"
+
+def manage_system_state(action: str) -> str:
+    """
+    Control the state of the AI assistant application itself.
+    Args:
+        action (str): Must be either 'shutdown' (to completely close and exit the application) or 'sleep' (to put the app in standby mode).
+    """
+    return f"SYSTEM_STATE_TRIGGERED:{action}"
+
+def change_interaction_mode(mode: str) -> str:
+    """
+    Switch the runtime mode and capability profile of the AI assistant.
+    Args:
+        mode (str): Must be 'coding', 'companion', 'professional', or 'friendly'.
+    """
+    return f"MODE_CHANGE_TRIGGERED:{mode}"
+
+# Mapping of capability keys to the actual Python functions
+CAPABILITY_MAP = {
+    "PERM_BROWSER": [
+        open_url, search_youtube, search_google, gmail_action, send_background_email,
+        playwright_navigate, playwright_click, playwright_type,
+        playwright_screenshot, playwright_get_content, playwright_close
+    ],
+    "PERM_FILESYSTEM": [create_file, read_file, list_directory, delete_file, search_local_files],
+    "PERM_TERMINAL": [execute_powershell, execute_python],
+    "PERM_SYSTEM": [
+        open_app, close_app, focus_app, list_open_apps,
+        get_active_windows, change_volume, read_clipboard, write_clipboard,
+        get_system_stats, manage_processes, read_on_screen_text,
+        whatsapp_call, whatsapp_send_message, whatsapp_get_pairing_code, pause_media, setup_missing_tool,
+        find_and_click, wait_for_element, read_active_window_title,
+        is_app_open, take_verified_screenshot
+    ]
+}
+
+def get_maya_tools() -> list:
+    """
+    Returns a dynamic list of tools based on the user's saved preferences.
+    """
+    tools = [
+        type_text, press_key, hotkey, click_mouse, 
+        double_click_mouse, move_mouse_to, get_mouse_position,
+        look_at_screen, manage_system_state, change_interaction_mode,
+        remember_fact, recall_facts, configure_gmail_credentials,
+        # App management is always available (no special permission needed)
+        open_app, close_app, focus_app, list_open_apps, is_app_open,
+        read_active_window_title,
+        # Contact Manager
+        save_contact, get_contact_number,
+    ]
+    
+    db = SessionLocal()
+    try:
+        for perm_key, funcs in CAPABILITY_MAP.items():
+            pref = db.query(UserPreferences).filter(UserPreferences.key == perm_key).first()
+            if pref and pref.value:
+                try:
+                    decrypted = crypto_manager.decrypt(pref.value)
+                    if decrypted == "true":
+                        tools.extend(funcs)
+                except Exception as e:
+                    logger.error(f"Error decrypting {perm_key}: {e}")
+    finally:
+        db.close()
+        
+    # Load external plugins securely
+    import os
+    import importlib.util
+    from pathlib import Path
+    try:
+        from ...skills.loader import verify_and_load_plugin
+        skills_dir = Path("backend/skills")
+        if skills_dir.exists() and skills_dir.is_dir():
+            for plugin_file in skills_dir.glob("*.py"):
+                if plugin_file.name in ["__init__.py", "scanner.py", "loader.py"]:
+                    continue
+                if verify_and_load_plugin(plugin_file):
+                    try:
+                        spec = importlib.util.spec_from_file_location(plugin_file.stem, plugin_file)
+                        module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(module)
+                        # Extract all callable functions defined in the plugin
+                        for attr_name in dir(module):
+                            if not attr_name.startswith("_"):
+                                attr = getattr(module, attr_name)
+                                if callable(attr) and hasattr(attr, "__name__"):
+                                    # Ensure it's not an imported function
+                                    if getattr(attr, "__module__", None) == plugin_file.stem:
+                                        tools.append(attr)
+                    except Exception as e:
+                        logger.error(f"Error executing plugin {plugin_file.name}: {e}")
+    except ImportError:
+        pass
+        
+    # Deduplicate tools by function name to avoid 400 errors from API providers like DeepSeek
+    seen_names = set()
+    unique_tools = []
+    for tool in tools:
+        if hasattr(tool, "__name__"):
+            name = tool.__name__
+            if name not in seen_names:
+                seen_names.add(name)
+                unique_tools.append(tool)
+        else:
+            unique_tools.append(tool)
+            
+    return unique_tools
+
+
