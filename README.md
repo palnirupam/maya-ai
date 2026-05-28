@@ -1,9 +1,11 @@
 <div align="center">
   <h1>✨ Maya AI - The Next Gen Desktop Copilot</h1>
   <br/>
-  <img src="file:///C:/Users/palni/.gemini/antigravity/brain/ca214ae2-69c7-4ebf-b17d-6f12cafa1885/maya_ai_banner_1779539058717.png" alt="Maya AI Banner" width="800"/>
+  <img src="assets/maya_ai_banner.png" alt="Maya AI Banner" width="800"/>
   <br/>
   <p><i>A privacy-first, fully autonomous, and highly emotional AI companion for Windows.</i></p>
+  <br/>
+  <a href="https://github.com/palnirupam/maya-ai">📁 GitHub Repository</a>
 </div>
 
 ---
