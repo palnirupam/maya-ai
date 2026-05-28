@@ -4,8 +4,6 @@
   <img src="assets/maya_ai_banner.png" alt="Maya AI Banner" width="800"/>
   <br/>
   <p><i>A privacy-first, fully autonomous, and highly emotional AI companion for Windows.</i></p>
-  <br/>
-  <a href="https://github.com/palnirupam/maya-ai">📁 GitHub Repository</a>
 </div>
 
 ---
