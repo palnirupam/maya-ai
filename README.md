@@ -54,21 +54,28 @@ Spyware is creepy. Maya is transparent.
 
 ## ⚙️ Initial Setup
 
-1. **API Keys Configuration**:
+1. **Clone the Repository**:
+   First, clone the repository to your local machine:
+   ```bash
+   git clone https://github.com/palnirupam/maya-ai.git
+   cd maya-ai
+   ```
+
+2. **API Keys Configuration**:
    Create a `.env` file in the `backend/` directory and add your keys:
    ```env
    GEMINI_API_KEY=your_gemini_api_key_here
    ELEVENLABS_API_KEY=your_elevenlabs_key_here # Optional
    ```
 
-2. **📬 Headless Gmail Setup (No Files to Edit!)**:
+3. **📬 Headless Gmail Setup (No Files to Edit!)**:
    You do **not** need to open any code files or edit `.env` to set up your email! Maya is fully conversational.
    * **Step 1:** Turn on **2-Step Verification** on your Google Account, search for **App Passwords**, name it "Maya AI", and copy the generated 16-letter code.
    * **Step 2:** Simply open the **Telegram Bot on your mobile phone** (or the desktop chat interface) and tell Maya: 
      > *"Save my email as devnilasarker@gmail.com and password as ssfszsctppzaotlx"*
    * **Step 3:** Maya will automatically clean the password, encrypt the credentials securely, and save them in her local SQLite database. You're ready to send background emails! 🚀
 
-3. **Install All Dependencies**:
+4. **Install All Dependencies**:
    Open a terminal in the root `maya-ai` directory and run:
    ```bash
    npm run install:all
