@@ -17,8 +17,21 @@ class OCREngine:
     def _initialize_reader(self):
         try:
             logger.info("Initializing EasyOCR Model (this might take a few seconds on first run)...")
-            # We use 'en' and 'bn' if needed later, just 'en' for now for speed.
-            self.reader = easyocr.Reader(['en'], gpu=True)
+            import sys
+            import os
+            
+            old_stdout = sys.stdout
+            old_stderr = sys.stderr
+            try:
+                with open(os.devnull, 'w') as fnull:
+                    sys.stdout = fnull
+                    sys.stderr = fnull
+                    # We use 'en' and 'bn' if needed later, just 'en' for now for speed.
+                    self.reader = easyocr.Reader(['en'], gpu=True)
+            finally:
+                sys.stdout = old_stdout
+                sys.stderr = old_stderr
+                
             logger.info("EasyOCR Initialized successfully.")
         except Exception as e:
             logger.error(f"Failed to initialize EasyOCR: {e}")

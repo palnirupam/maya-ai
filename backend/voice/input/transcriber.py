@@ -2,9 +2,106 @@ import logging
 import numpy as np
 import subprocess
 import os
+import base64
+from typing import Optional
 from faster_whisper import WhisperModel
 
 logger = logging.getLogger(__name__)
+
+# ── Gemini STT ────────────────────────────────────────────────────────────────
+# Uses Gemini's audio understanding capability to transcribe Bengali/Hindi/English
+# and mixed-language (Banglish/Hinglish) with near-perfect accuracy.
+# Falls back to Faster-Whisper if Gemini API is unavailable.
+
+_GEMINI_STT_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "gemini-2.0-flash:generateContent"
+)
+
+_STT_PROMPT = (
+    "Transcribe the following audio exactly as spoken. "
+    "The speaker may use Bengali, Hindi, English, or any mix of these languages "
+    "(Banglish / Hinglish). "
+    "Preserve the exact words and script: use Bengali Unicode for Bengali words, "
+    "Devanagari for Hindi words, and Latin script for English words. "
+    "Output ONLY the transcription — no explanations, no punctuation corrections, "
+    "no extra words."
+)
+
+
+def _get_gemini_api_key() -> Optional[str]:
+    """Fetch Gemini API key — tries DB first, then environment variable."""
+    # Try both import path styles (standalone script vs uvicorn module)
+    for module_prefix in ("backend.database", "database"):
+        try:
+            conn_mod = __import__(f"{module_prefix}.connection", fromlist=["SessionLocal"])
+            model_mod = __import__(f"{module_prefix}.models", fromlist=["UserPreferences"])
+            crypto_mod = __import__(f"{module_prefix}.crypto", fromlist=["crypto_manager"])
+            db = conn_mod.SessionLocal()
+            try:
+                pref = db.query(model_mod.UserPreferences).filter(
+                    model_mod.UserPreferences.key == "GEMINI_API_KEY"
+                ).first()
+                if pref and pref.value:
+                    return crypto_mod.crypto_manager.decrypt(pref.value).strip()
+            finally:
+                db.close()
+        except Exception:
+            continue
+    # Last resort: environment variable
+    return os.getenv("GEMINI_API_KEY")
+
+
+async def _transcribe_with_gemini(wav_path: str) -> Optional[str]:
+    """
+    Transcribe a WAV file using Gemini's audio understanding API.
+    Returns transcribed text, or None if the call fails (triggers Whisper fallback).
+    """
+    api_key = _get_gemini_api_key()
+    if not api_key:
+        return None
+
+    try:
+        with open(wav_path, "rb") as f:
+            audio_bytes = f.read()
+
+        # Gemini has a 20MB inline data limit — skip and use Whisper for large files
+        if len(audio_bytes) > 18 * 1024 * 1024:
+            logger.warning("[GeminiSTT] Audio file too large (>18MB) — using Whisper.")
+            return None
+
+        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": _STT_PROMPT},
+                    {"inline_data": {"mime_type": "audio/wav", "data": audio_b64}},
+                ]
+            }],
+            "generationConfig": {"temperature": 0},
+        }
+
+        import httpx
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                _GEMINI_STT_URL,
+                params={"key": api_key},
+                json=payload,
+            )
+
+        if resp.status_code != 200:
+            logger.warning(f"[GeminiSTT] API error {resp.status_code} — using Whisper.")
+            return None
+
+        data = resp.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        logger.info(f"[GeminiSTT] ✅ Transcribed: {text}")
+        return text
+
+    except Exception as e:
+        logger.warning(f"[GeminiSTT] Failed ({e}) — falling back to Whisper.")
+        return None
 
 class Transcriber:
     """
@@ -56,65 +153,91 @@ class Transcriber:
     async def transcribe(self, audio_data: str | np.ndarray) -> str:
         """
         Transcribe audio from a file path (str) or a float32 PCM numpy array.
-        If a file path is given, converts WebM to WAV first via ffmpeg.
-        Returns the transcribed text.
+
+        Strategy (dual-engine):
+          1. PRIMARY: Gemini Audio Understanding API
+             → Perfect for Bengali / Hindi / English / mixed-language speech
+          2. FALLBACK: Faster-Whisper (existing engine)
+             → Used when Gemini API key is missing or call fails
         """
+        import asyncio
+
+        wav_path_to_cleanup = None
+
+        # ── Step 1: Convert WebM → WAV (browser sends WebM/Opus) ────────────
+        if isinstance(audio_data, str):
+            logger.info(f"[Transcriber] Converting audio file: {audio_data}")
+            wav_path = await asyncio.to_thread(self._convert_webm_to_wav, audio_data)
+            if not wav_path:
+                logger.error("[Transcriber] Audio conversion failed.")
+                return ""
+
+            # Silence check — warn if mic is muted/quiet
+            try:
+                import wave, struct
+                with wave.open(wav_path, "rb") as wf:
+                    frames = wf.readframes(wf.getnframes())
+                    samples = struct.unpack(f"<{len(frames)//2}h", frames)
+                    max_amp = max(abs(s) for s in samples) if samples else 0
+                    logger.info(f"[Transcriber] Max amplitude: {max_amp}/32768")
+                    if max_amp < 100:
+                        logger.warning(
+                            "[Transcriber] Audio is nearly silent — "
+                            "microphone may be muted or wrong device selected."
+                        )
+            except Exception as e:
+                logger.debug(f"[Transcriber] Amplitude check failed: {e}")
+
+            audio_data = wav_path
+            wav_path_to_cleanup = wav_path
+
+        # ── Step 2: Try Gemini STT first (primary engine) ───────────────────
+        if isinstance(audio_data, str):  # only for file paths (wav)
+            try:
+                gemini_text = await _transcribe_with_gemini(audio_data)
+                if gemini_text:
+                    # Cleanup and return Gemini result
+                    if wav_path_to_cleanup and os.path.exists(wav_path_to_cleanup):
+                        try:
+                            os.remove(wav_path_to_cleanup)
+                        except Exception:
+                            pass
+                    return gemini_text
+            except Exception as e:
+                logger.warning(f"[Transcriber] Gemini STT error: {e} — using Whisper.")
+
+        # ── Step 3: Fallback — Faster-Whisper ──────────────────────────────
         if self.model is None:
+            logger.error("[Transcriber] Whisper model not loaded and Gemini failed.")
             return ""
 
         try:
-            import asyncio
-
-            wav_path_to_cleanup = None
-
-            # If given a file path (WebM from browser), convert to WAV first
-            if isinstance(audio_data, str):
-                logger.info(f"Converting audio file: {audio_data}")
-                wav_path = await asyncio.to_thread(self._convert_webm_to_wav, audio_data)
-                if not wav_path:
-                    logger.error("Audio conversion failed, cannot transcribe.")
-                    return ""
-                
-                # DIAGNOSTIC: Check if the audio is completely silent
-                try:
-                    import wave
-                    import struct
-                    with wave.open(wav_path, 'rb') as wf:
-                        frames = wf.readframes(wf.getnframes())
-                        samples = struct.unpack(f"<{len(frames)//2}h", frames)
-                        max_amp = max(abs(s) for s in samples) if samples else 0
-                        logger.info(f"DIAGNOSTIC: Max audio amplitude is {max_amp} (Max possible: 32768)")
-                        if max_amp < 100:
-                            logger.warning("WARNING: The audio is almost completely silent! The user's microphone might be muted or the wrong device is selected in Windows.")
-                except Exception as e:
-                    logger.error(f"Failed to check audio volume: {e}")
-
-                audio_data = wav_path
-                wav_path_to_cleanup = wav_path
-
-            def _run_transcription():
-                segments, info = self.model.transcribe(
+            def _run_whisper():
+                segments, _ = self.model.transcribe(
                     audio_data,
                     beam_size=3,
-                    language=None,    
-                    vad_filter=False,  # Disabled because it might be aggressively cutting out the user's voice
-                    # vad_parameters=dict(min_silence_duration_ms=1000, speech_pad_ms=400),
-                    initial_prompt="হ্যালো মায়া, কেমন আছো? नमस्ते माया, आप कैसे हैं? Hello Maya, how are you doing?" # Biases the model to Bengali/Hindi/English
+                    language=None,
+                    vad_filter=False,
+                    initial_prompt=(
+                        "হ্যালো মায়া, কেমন আছো? "
+                        "नमस्ते माया, आप कैसे हैं? "
+                        "Hello Maya, how are you doing?"
+                    ),
                 )
-                return "".join([segment.text for segment in segments])
+                return "".join(seg.text for seg in segments)
 
-            text = await asyncio.to_thread(_run_transcription)
-
-            # Cleanup converted WAV
+            text = await asyncio.to_thread(_run_whisper)
+            logger.info(f"[Transcriber][Whisper] Transcribed: {text.strip()}")
+        except Exception as e:
+            logger.error(f"[Transcriber] Whisper error: {e}")
+            text = ""
+        finally:
             if wav_path_to_cleanup and os.path.exists(wav_path_to_cleanup):
                 try:
                     os.remove(wav_path_to_cleanup)
-                except:
+                except Exception:
                     pass
 
-            return text.strip()
-        except Exception as e:
-            logger.error(f"Transcription error: {e}")
-            return ""
+        return text.strip()
 
 transcriber = Transcriber()

@@ -3,6 +3,7 @@ from typing import AsyncGenerator
 
 from .edge_tts_adapter import EdgeTTSAdapter, detect_language
 from ..providers.gpt_sovits_adapter import GPTSoVITSAdapter
+from ..providers.gemini_live_adapter import GeminiLiveAdapter
 from .elevenlabs import ElevenLabsAdapter
 from ..emotions.formatter import formatter
 from backend.database.connection import SessionLocal
@@ -25,7 +26,8 @@ class TTSRouter:
         self._edge = EdgeTTSAdapter()
         self._gpt_sovits = GPTSoVITSAdapter()
         self._elevenlabs = ElevenLabsAdapter()
-        self.primary_provider = "edge"
+        self._gemini = GeminiLiveAdapter()
+        self.primary_provider = "gemini"  # default: Gemini Native Audio
         self.reload_key()
 
     def reload_key(self):
@@ -40,18 +42,21 @@ class TTSRouter:
             pref = db.query(UserPreferences).filter(UserPreferences.key == "TTS_PRIMARY_PROVIDER").first()
             if pref and pref.value:
                 try:
-                    self.primary_provider = crypto_manager.decrypt(pref.value).strip()
+                    stored = crypto_manager.decrypt(pref.value).strip()
+                    # 'edge' was the old auto-default — upgrade it to 'gemini'.
+                    # Only honour explicit user choices: 'gemini', 'elevenlabs', 'gpt_sovits'.
+                    if stored in ("gemini", "elevenlabs", "gpt_sovits"):
+                        self.primary_provider = stored
+                    else:
+                        self.primary_provider = "gemini"  # upgrade old 'edge' default
                 except Exception:
-                    self.primary_provider = "edge"
+                    self.primary_provider = "gemini"
             else:
-                if self._elevenlabs.api_key:
-                    self.primary_provider = "elevenlabs"
-                else:
-                    self.primary_provider = "edge"
+                self.primary_provider = "gemini"
             logger.info(f"TTS Router reloaded. Primary TTS Provider: {self.primary_provider}")
         except Exception as e:
             logger.error(f"Failed to reload primary TTS provider: {e}")
-            self.primary_provider = "edge"
+            self.primary_provider = "gemini"
         finally:
             db.close()
 
@@ -71,10 +76,23 @@ class TTSRouter:
         if not clean_text:
             return
 
-        primary = getattr(self, "primary_provider", "edge")
+        primary = getattr(self, "primary_provider", "gemini")
 
-        # 1. ElevenLabs / cvoice.ai
-        if primary == "elevenlabs":
+        # 1. Gemini Native Audio (default — ultra-realistic human-like voice)
+        if primary == "gemini":
+            try:
+                has_audio = False
+                async for chunk in self._gemini.generate_audio_stream(clean_text, lang, emotion):
+                    has_audio = True
+                    yield chunk
+                if has_audio:
+                    return
+                logger.warning("Gemini TTS yielded no audio — falling back to Edge TTS.")
+            except Exception as e:
+                logger.warning(f"Gemini TTS stream failed: {e}. Falling back to Edge TTS.")
+
+        # 2. ElevenLabs / cvoice.ai
+        elif primary == "elevenlabs":
             if self._elevenlabs.api_key:
                 try:
                     has_audio = False

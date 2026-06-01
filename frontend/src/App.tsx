@@ -1,28 +1,58 @@
 import { useEffect, useState } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
 import { VoiceOrb } from './components/assistant/VoiceOrb';
 import { EmotionIndicator } from './components/assistant/EmotionIndicator';
+import { WaveformVisualizer } from './components/assistant/WaveformVisualizer';
 import { ToolApprovalCard } from './components/chat/ToolApprovalCard';
 import { SettingsModal } from './components/ui/SettingsModal';
 import { wsClient } from './services/websocket';
 import { useAssistantStore } from './store/assistantStore';
-import { useVoice } from './hooks/useVoice';
-import { Mic, Settings } from 'lucide-react';
+import { useVoiceSession } from './hooks/useVoiceSession';
+import { Mic, MicOff, Settings, Radio } from 'lucide-react';
+
+// Status labels for each session state
+const SESSION_LABELS: Record<string, string> = {
+  SESSION_IDLE:    'Tap to start a conversation',
+  LISTENING:       'Listening...',
+  RECORDING:       "I'm listening...",
+  SENDING:         'Processing your voice...',
+  THINKING:        'Thinking...',
+  MAYA_SPEAKING:   'Maya is speaking',
+  SESSION_ERROR:   'Something went wrong — retrying...',
+};
 
 function App() {
   const { appState, pendingToolRequests } = useAssistantStore();
-  const { isRecording, startRecording, stopRecording } = useVoice();
+  const { sessionState, volume, startSession, endSession, isSessionActive } = useVoiceSession();
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+
+  // Also keep text input available as fallback
+  const [textValue, setTextValue] = useState('');
 
   useEffect(() => {
     wsClient.connect();
     return () => wsClient.disconnect();
   }, []);
 
+  const handleTextSend = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (textValue.trim() && appState !== 'offline') {
+      wsClient.clearAudioQueue?.();
+      wsClient.send('text_message', { text: textValue.trim() });
+      setTextValue('');
+    }
+  };
+
+  const isSessionBusy =
+    sessionState === 'THINKING' ||
+    sessionState === 'MAYA_SPEAKING' ||
+    sessionState === 'SENDING';
+
   return (
     <div className="relative flex flex-col items-center justify-center h-screen w-full bg-background text-foreground overflow-hidden">
-      
+
       {/* Settings Button */}
-      <button 
+      <button
         onClick={() => setIsSettingsOpen(true)}
         className="absolute top-6 right-6 text-slate-400 hover:text-white transition-colors z-20"
       >
@@ -34,23 +64,61 @@ function App() {
 
       {/* Background Decor */}
       <div className="absolute top-0 left-0 w-full h-full overflow-hidden z-0 pointer-events-none">
-        <div className="absolute -top-1/2 -left-1/2 w-full h-full bg-primary/10 rounded-full blur-[120px]"></div>
+        <div className="absolute -top-1/2 -left-1/2 w-full h-full bg-primary/10 rounded-full blur-[120px]" />
+        {/* Extra glow when session active */}
+        <AnimatePresence>
+          {isSessionActive && (
+            <motion.div
+              key="session-glow"
+              className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-96 h-96 rounded-full blur-[160px]"
+              style={{ backgroundColor: sessionState === 'RECORDING' ? 'rgba(34,197,94,0.08)' : 'rgba(192,132,252,0.08)' }}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 1 }}
+            />
+          )}
+        </AnimatePresence>
       </div>
 
-      <div className="z-10 flex flex-col items-center gap-12 w-full max-w-2xl px-4">
+      <div className="z-10 flex flex-col items-center gap-8 w-full max-w-2xl px-4">
+
+        {/* Maya Orb — pass sessionState as appState override when session is active */}
         <div className="relative">
           <VoiceOrb />
           <div className="absolute -bottom-2 left-1/2 -translate-x-1/2">
             <EmotionIndicator />
           </div>
         </div>
-        
+
+        {/* Name + Status */}
         <div className="text-center">
           <h1 className="text-4xl font-bold tracking-tight text-white/90 drop-shadow-lg">Maya</h1>
-          <p className="text-sm mt-2 text-white/50 tracking-widest uppercase">
-            {appState.toUpperCase()}
-          </p>
+          <motion.p
+            key={sessionState}
+            className="text-sm mt-2 text-white/50 tracking-widest"
+            initial={{ opacity: 0, y: 4 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.3 }}
+          >
+            {SESSION_LABELS[sessionState] ?? appState.toUpperCase()}
+          </motion.p>
         </div>
+
+        {/* Live Waveform (visible during session) */}
+        <AnimatePresence>
+          {isSessionActive && (
+            <motion.div
+              key="waveform"
+              initial={{ opacity: 0, scaleY: 0 }}
+              animate={{ opacity: 1, scaleY: 1 }}
+              exit={{ opacity: 0, scaleY: 0 }}
+              transition={{ duration: 0.3 }}
+            >
+              <WaveformVisualizer volume={volume} sessionState={sessionState} />
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* Tool Approval Queue */}
         {pendingToolRequests.length > 0 && (
@@ -61,44 +129,66 @@ function App() {
           </div>
         )}
 
-        {/* Tap to Talk Button */}
-        <button
-          onClick={isRecording ? stopRecording : startRecording}
-          disabled={appState === 'offline'}
-          className={`flex items-center gap-2 px-8 py-4 rounded-full font-semibold transition-all shadow-xl ${
-            isRecording 
-              ? 'bg-red-500 hover:bg-red-600 text-white animate-pulse' 
-              : 'bg-primary hover:bg-primary/90 text-primary-foreground'
-          } disabled:opacity-50 disabled:cursor-not-allowed`}
-        >
-          <Mic size={24} />
-          {isRecording ? "Tap to Stop" : "Tap to Speak"}
-        </button>
+        {/* ── Main Session Button ── */}
+        {!isSessionActive ? (
+          <motion.button
+            id="start-session-btn"
+            onClick={startSession}
+            disabled={appState === 'offline'}
+            className="flex items-center gap-3 px-10 py-5 rounded-full font-semibold text-base transition-all shadow-2xl bg-primary hover:bg-primary/90 text-primary-foreground disabled:opacity-50 disabled:cursor-not-allowed"
+            whileHover={{ scale: 1.04 }}
+            whileTap={{ scale: 0.97 }}
+          >
+            <Radio size={22} />
+            Start Session
+          </motion.button>
+        ) : (
+          <div className="flex flex-col items-center gap-3">
+            {/* Interrupt button — shown while Maya is speaking */}
+            <AnimatePresence>
+              {sessionState === 'MAYA_SPEAKING' && (
+                <motion.p
+                  key="interrupt-hint"
+                  className="text-xs text-white/40 tracking-wide"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                >
+                  Speak to interrupt Maya
+                </motion.p>
+              )}
+            </AnimatePresence>
+
+            {/* End Session button */}
+            <motion.button
+              id="end-session-btn"
+              onClick={endSession}
+              className="flex items-center gap-3 px-8 py-4 rounded-full font-semibold text-sm transition-all shadow-xl bg-red-500/20 hover:bg-red-500/40 text-red-300 border border-red-500/30"
+              whileHover={{ scale: 1.04 }}
+              whileTap={{ scale: 0.97 }}
+            >
+              <MicOff size={18} />
+              End Session
+            </motion.button>
+          </div>
+        )}
 
         {/* Text Input Fallback */}
-        <form 
-          onSubmit={(e) => {
-            e.preventDefault();
-            const form = e.target as HTMLFormElement;
-            const input = form.elements.namedItem('textInput') as HTMLInputElement;
-            if (input.value.trim() && appState !== 'offline') {
-              wsClient.clearAudioQueue();
-              wsClient.send('text_message', { text: input.value.trim() });
-              input.value = '';
-            }
-          }}
-          className="w-full max-w-md mt-4 flex gap-2"
+        <form
+          onSubmit={handleTextSend}
+          className="w-full max-w-md flex gap-2"
         >
-          <input 
-            type="text" 
-            name="textInput"
-            placeholder="Or type your message here..." 
+          <input
+            type="text"
+            value={textValue}
+            onChange={(e) => setTextValue(e.target.value)}
+            placeholder="Or type your message here..."
             disabled={appState === 'offline' || appState === 'thinking'}
             className="flex-1 bg-black/20 border border-white/10 rounded-full px-6 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50 text-white placeholder:text-white/30 backdrop-blur-sm transition-all"
           />
-          <button 
+          <button
             type="submit"
-            disabled={appState === 'offline' || appState === 'thinking'}
+            disabled={appState === 'offline' || appState === 'thinking' || !textValue.trim()}
             className="bg-primary hover:bg-primary/90 text-primary-foreground px-6 py-3 rounded-full text-sm font-semibold transition-all disabled:opacity-50 disabled:cursor-not-allowed"
           >
             Send

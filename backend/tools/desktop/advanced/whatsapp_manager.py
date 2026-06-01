@@ -1,4 +1,5 @@
 import os
+import asyncio
 import subprocess
 import logging
 from typing import Optional
@@ -10,6 +11,68 @@ logger = logging.getLogger(__name__)
 class WhatsAppManager:
     def __init__(self):
         self.process = None
+        self.api_key = self._get_or_create_key()
+
+    def _get_or_create_key(self):
+        import os
+        import sys
+        import tempfile
+        import secrets
+        import shutil
+        import atexit
+        import subprocess
+        
+        key_file = os.path.join(tempfile.gettempdir(), "maya_wa_key.tmp")
+        
+        # Cleanup on graceful exit
+        atexit.register(lambda: os.remove(key_file) if os.path.exists(key_file) else None)
+        
+        try:
+            if os.path.exists(key_file):
+                with open(key_file, "r") as f:
+                    return f.read().strip()
+            
+            new_key = secrets.token_hex(32)
+            
+            # Atomic write to prevent race conditions
+            dir_name = os.path.dirname(key_file)
+            with tempfile.NamedTemporaryFile(mode='w', dir=dir_name, delete=False) as tmp:
+                tmp.write(new_key)
+                tmp_path = tmp.name
+            shutil.move(tmp_path, key_file)
+            
+            # Set restrictive permissions properly (Windows vs POSIX)
+            if sys.platform == "win32":
+                username = os.environ.get("USERNAME", "")
+                result = subprocess.run(
+                    ["icacls", key_file, "/inheritance:r", "/grant:r", f"{username}:(R,W)"],
+                    capture_output=True
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(f"Failed to set file permissions: {result.stderr.decode()}")
+            else:
+                os.chmod(key_file, 0o600)
+                
+            return new_key
+        except Exception as e:
+            logger.error(f"[WA] Key generation error: {e}")
+            return secrets.token_hex(32)
+
+    def _get_headers(self):
+        return {"x-api-key": self.api_key}
+
+    def _normalize_phone(self, phone: str) -> str:
+        clean_phone = "".join(c for c in phone if c.isdigit())
+        if not clean_phone:
+            return None
+        if clean_phone.startswith("00"):
+            clean_phone = clean_phone[2:]
+        elif clean_phone.startswith("0"):
+            clean_phone = clean_phone[1:]
+        if len(clean_phone) == 10:
+            clean_phone = "91" + clean_phone
+        return clean_phone
+
 
     def _kill_port_9001(self):
         try:
@@ -56,7 +119,7 @@ class WhatsAppManager:
             
         # Smart Check: If the service is already running and connected/authenticated, do not restart it
         try:
-            resp = httpx.get("http://127.0.0.1:9001/status", timeout=1.5)
+            resp = httpx.get("http://127.0.0.1:9001/status", timeout=1.5, headers=self._get_headers())
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("status") in ("connected", "authenticated"):
@@ -81,11 +144,14 @@ class WhatsAppManager:
             # Spawn Node.js background process and write stdout/stderr to a log file
             log_path = os.path.abspath(os.path.join(script_dir, "../../../../data/whatsapp_service.log"))
             self.log_file = open(log_path, "a", encoding="utf-8")
+            env = os.environ.copy()
+            env["WA_API_KEY"] = self.api_key
             self.process = subprocess.Popen(
                 ["node", "index.js"],
                 cwd=service_dir,
                 stdout=self.log_file,
                 stderr=self.log_file,
+                env=env,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
             time.sleep(1.5) # Allow it to bind port
@@ -108,7 +174,7 @@ class WhatsAppManager:
         """Check status, retrying up to 3 times to handle brief reconnect windows."""
         for attempt in range(3):
             try:
-                resp = httpx.get("http://127.0.0.1:9001/status", timeout=3.0)
+                resp = httpx.get("http://127.0.0.1:9001/status", timeout=3.0, headers=self._get_headers())
                 if resp.status_code == 200:
                     data = resp.json()
                     if data.get("status") in ["connected", "authenticated"]:
@@ -127,7 +193,7 @@ class WhatsAppManager:
         poll_count = 0
         while time.time() < deadline:
             try:
-                resp = httpx.get("http://127.0.0.1:9001/status", timeout=3.0)
+                resp = httpx.get("http://127.0.0.1:9001/status", timeout=3.0, headers=self._get_headers())
                 if resp.status_code == 200:
                     status = resp.json().get("status", "")
                     if status in ("connected", "authenticated"):
@@ -151,24 +217,16 @@ class WhatsAppManager:
             logger.error("[WA] Cannot send message: WhatsApp timed out waiting for ready state.")
             return False
         
-        clean_phone = "".join(c for c in phone if c.isdigit())
+        clean_phone = self._normalize_phone(phone)
         if not clean_phone:
             logger.error(f"Invalid phone format: {phone}")
             return False
-            
-        if clean_phone.startswith("00"):
-            clean_phone = clean_phone[2:]
-        elif clean_phone.startswith("0"):
-            clean_phone = clean_phone[1:]
-            
-        if len(clean_phone) == 10:
-            clean_phone = "91" + clean_phone
             
         # Retry send up to 3 times in case of transient disconnect
         for attempt in range(3):
             try:
                 payload = {"to": clean_phone, "message": message}
-                resp = httpx.post("http://127.0.0.1:9001/send", json={"to": clean_phone, "message": message}, timeout=90.0)
+                resp = httpx.post("http://127.0.0.1:9001/send", json={"to": clean_phone, "message": message}, timeout=90.0, headers=self._get_headers())
                 if resp.status_code == 200:
                     data = resp.json()
                     if data.get("success"):
@@ -186,25 +244,44 @@ class WhatsAppManager:
             
         return False
 
+    def revoke_messages(self, phone: str, count: int = 1) -> bool:
+        """Revokes (Deletes for Everyone) the most recent messages sent by you to a specific phone number."""
+        self.start()
+        if not self.wait_for_connected():
+            logger.error("[WA] Cannot revoke message: WhatsApp timed out waiting for ready state.")
+            return False
+            
+        clean_phone = self._normalize_phone(phone)
+        if not clean_phone:
+            logger.error(f"Invalid phone format: {phone}")
+            return False
+            
+        to_chat_id = f"{clean_phone}@c.us"
+        try:
+            payload = {"toChatId": to_chat_id, "count": count}
+            resp = httpx.post("http://127.0.0.1:9001/revoke", json=payload, timeout=90.0, headers=self._get_headers())
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success"):
+                    revoked = data.get("revoked", 0)
+                    logger.info(f"Successfully revoked {revoked} WhatsApp message(s) for {clean_phone}")
+                    return True
+        except Exception as e:
+            logger.error(f"Error revoking WhatsApp messages: {e}")
+            
+        return False
+
     def get_pairing_code(self, phone: str) -> Optional[str]:
         # Auto-ensure process is started
         self.start()
         
-        clean_phone = "".join(c for c in phone if c.isdigit())
+        clean_phone = self._normalize_phone(phone)
         if not clean_phone:
             logger.error(f"Invalid phone format for pairing: {phone}")
             return None
             
-        if clean_phone.startswith("00"):
-            clean_phone = clean_phone[2:]
-        elif clean_phone.startswith("0"):
-            clean_phone = clean_phone[1:]
-            
-        if len(clean_phone) == 10:
-            clean_phone = "91" + clean_phone
-            
         try:
-            resp = httpx.get(f"http://127.0.0.1:9001/pair-code?phone={clean_phone}", timeout=30.0)
+            resp = httpx.get(f"http://127.0.0.1:9001/pair-code?phone={clean_phone}", timeout=30.0, headers=self._get_headers())
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("success"):
@@ -223,20 +300,14 @@ class WhatsAppManager:
         # Wait for WhatsApp to be fully ready (handles post-startup sync delay)
         if not self.wait_for_connected():
             return {"success": False, "message_id": None, "error": "WhatsApp is not connected (timed out waiting for ready state)."}
-        clean_phone = "".join(c for c in phone if c.isdigit())
+        clean_phone = self._normalize_phone(phone)
         if not clean_phone:
             return {"success": False, "message_id": None, "error": "Invalid phone number"}
-        if clean_phone.startswith("00"):
-            clean_phone = clean_phone[2:]
-        elif clean_phone.startswith("0"):
-            clean_phone = clean_phone[1:]
-        if len(clean_phone) == 10:
-            clean_phone = "91" + clean_phone
 
         for attempt in range(3):
             try:
                 payload = {"to": clean_phone, "filePath": file_path, "caption": caption}
-                resp = httpx.post("http://127.0.0.1:9001/send-file", json=payload, timeout=90.0)
+                resp = httpx.post("http://127.0.0.1:9001/send-file", json=payload, timeout=90.0, headers=self._get_headers())
                 if resp.status_code == 200:
                     data = resp.json()
                     if data.get("success"):
@@ -263,19 +334,13 @@ class WhatsAppManager:
         if not self.wait_for_connected():
             return [{"file": f.get("filePath","?"), "success": False, "error": "WhatsApp is not connected (timed out waiting for ready state)."} for f in files]
             
-        clean_phone = "".join(c for c in phone if c.isdigit())
+        clean_phone = self._normalize_phone(phone)
         if not clean_phone:
             return [{"file": f.get("filePath","?"), "success": False, "error": "Invalid phone"} for f in files]
-        if clean_phone.startswith("00"):
-            clean_phone = clean_phone[2:]
-        elif clean_phone.startswith("0"):
-            clean_phone = clean_phone[1:]
-        if len(clean_phone) == 10:
-            clean_phone = "91" + clean_phone
 
         try:
             payload = {"to": clean_phone, "files": files}
-            resp = httpx.post("http://127.0.0.1:9001/send-files", json=payload, timeout=120.0)
+            resp = httpx.post("http://127.0.0.1:9001/send-files", json=payload, timeout=120.0, headers=self._get_headers())
             if resp.status_code == 200:
                 return resp.json().get("results", [])
             logger.error(f"send_files failed: {resp.text}")
@@ -290,11 +355,146 @@ class WhatsAppManager:
         Possible values: 'sent', 'delivered', 'read', 'played', 'pending', 'unknown'
         """
         try:
-            resp = httpx.get(f"http://127.0.0.1:9001/message-status?messageId={message_id}", timeout=5.0)
+            resp = httpx.get(f"http://127.0.0.1:9001/message-status?messageId={message_id}", timeout=5.0, headers=self._get_headers())
             if resp.status_code == 200:
                 return resp.json().get("status", "unknown")
         except Exception as e:
             logger.error(f"get_message_status error: {e}")
         return "unknown"
+
+
+    def fetch_messages(self, phone: str, limit: int = None) -> dict:
+        import os
+        self.start()
+        if not self.wait_for_connected():
+            return {"success": False, "error": "WhatsApp is not connected."}
+            
+        clean_phone = self._normalize_phone(phone)
+        if not clean_phone:
+            return {"success": False, "error": "Invalid phone format"}
+            
+        effective_limit = limit or int(os.getenv("WHATSAPP_MSG_LIMIT", "10"))
+        
+        try:
+            logger.debug(f"[WA] Fetching messages for ...{clean_phone[-4:]}")
+            resp = httpx.get(
+                f"http://127.0.0.1:9001/fetch-messages",
+                params={"phone": clean_phone, "limit": effective_limit},
+                headers=self._get_headers(),
+                timeout=10.0
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            else:
+                return {"success": False, "error": resp.json().get("error", "Unknown error")}
+        except Exception as e:
+            logger.error(f"[WA] fetch_messages error: {e}")
+            return {"success": False, "error": str(e)}
+
+    # ───────────────────────────────────────────────────────────────────
+    # Incoming Message Listener (for WhatsApp Read + Reply)
+
+    # ───────────────────────────────────────────────────────────────────
+
+    async def poll_triggered(self, client: httpx.AsyncClient = None) -> list:
+        """
+        Drain the Node.js triggered queue.
+        Returns a list of incoming message dicts, or [] on error.
+        Raises exceptions to be handled by the caller.
+        """
+        try:
+            if client:
+                resp = await client.get("http://127.0.0.1:9001/poll-triggered", headers=self._get_headers(), timeout=5.0)
+                if resp.status_code == 200:
+                    return resp.json().get("items", [])
+            else:
+                async with httpx.AsyncClient() as temp_client:
+                    resp = await temp_client.get("http://127.0.0.1:9001/poll-triggered", headers=self._get_headers(), timeout=5.0)
+                    if resp.status_code == 200:
+                        return resp.json().get("items", [])
+        except Exception as e:
+            raise e
+        return []
+
+    async def start_incoming_listener(self, callback) -> None:
+        """
+        Polls /poll-triggered every 2 seconds.
+        Calls await callback(item) for each new incoming message.
+        Maintains a single HTTP client and properly handles cancellation.
+        """
+        logger.info("[WA] Incoming message listener started (polling every 2s).")
+        consecutive_errors = 0
+        
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                while True:
+                    try:
+                        items = await self.poll_triggered(client)
+                        for item in items:
+                            try:
+                                await callback(item)
+                            except Exception as cb_err:
+                                logger.error(f"[WA] Error in incoming message callback: {cb_err}")
+                        
+                        consecutive_errors = 0  # reset on success
+                    except asyncio.CancelledError:
+                        raise  # Always propagate cancellation
+                    except Exception as e:
+                        consecutive_errors += 1
+                        logger.debug(f"[WA] poll_triggered error (attempt {consecutive_errors}): {e}")
+                        if consecutive_errors >= 5:
+                            logger.error("[WA] Too many polling errors, exiting listener loop.")
+                            break
+                            
+                    await asyncio.sleep(2.0)
+        except asyncio.CancelledError:
+            logger.info("[WA] Incoming listener cancelled.")
+            raise
+
+    def reply_to_chat(self, chat_id: str, message: str) -> bool:
+        """
+        Send a reply to a specific WhatsApp chatId (works for both
+        private chats xxx@c.us and groups xxx@g.us).
+        """
+        try:
+            resp = httpx.post(
+                "http://127.0.0.1:9001/reply",
+                json={"chatId": chat_id, "message": message},
+                timeout=30.0
+            , headers=self._get_headers())
+            if resp.status_code == 200 and resp.json().get("success"):
+                logger.info(f"[WA] Reply sent to chatId={chat_id}")
+                return True
+            logger.warning(f"[WA] reply_to_chat failed: {resp.text}")
+        except Exception as e:
+            logger.error(f"[WA] reply_to_chat error: {e}")
+        return False
+
+    def register_known_sender(self, number: str) -> bool:
+        """Mark a phone number as known/approved in the Node.js service."""
+        try:
+            resp = httpx.post(
+                "http://127.0.0.1:9001/register-known",
+                json={"number": number},
+                timeout=5.0
+            , headers=self._get_headers())
+            return resp.status_code == 200
+        except Exception as e:
+            logger.error(f"[WA] register_known_sender error: {e}")
+            return False
+
+    def block_sender(self, number: str) -> bool:
+        """Block a phone number in the Node.js service (persists for session)."""
+        try:
+            resp = httpx.post(
+                "http://127.0.0.1:9001/block-number",
+                json={"number": number},
+                timeout=5.0
+            , headers=self._get_headers())
+            return resp.status_code == 200
+        except Exception as e:
+            logger.error(f"[WA] block_sender error: {e}")
+            return False
+
 
 whatsapp_manager = WhatsAppManager()

@@ -7,6 +7,36 @@ const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const fs   = require('fs');
 const path = require('path');
 const http = require('http');
+const crypto = require('crypto');
+
+// ── Rate Limiter State ────────────────────────────────────────────────────────
+const authAttempts = new Map();
+const WINDOW_MS = 60_000;
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, record] of authAttempts.entries()) {
+        if (now - record.first > WINDOW_MS) authAttempts.delete(ip);
+    }
+}, 10 * 60_000);
+
+function checkAuthRateLimit(ip) {
+    const now = Date.now();
+    const record = authAttempts.get(ip) || { count: 0, first: now };
+    if (now - record.first > WINDOW_MS) {
+        authAttempts.set(ip, { count: 1, first: now });
+        return true;
+    }
+    if (record.count >= 5) return false;
+    record.count++;
+    return true;
+}
+
+function safeCompare(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
 
 // Map of messageId → { ack, timestamp } for delivery tracking
 const sentMessageLog = {};
@@ -25,6 +55,18 @@ let pendingPhone     = null;
 let pairingResult    = null;
 let intentionalStop  = false;   // true = we destroyed client on purpose, don't reconnect
 let reconnectTimeout = null;
+
+// ── Incoming Message State ────────────────────────────────────────────────────
+const messageBuffers  = {};   // Map<chatId, Array<{from,name,body,ts}>> — circular, max BUFFER_MAX
+const triggeredQueue  = [];   // Pending items waiting for Python to poll
+const debounceTimers  = {};   // Map<chatId, timeoutHandle>
+const knownSenders    = new Set();   // Approved phone numbers (no string after @c.us)
+const blockedSenders  = new Set();   // Blocked phone numbers
+
+const BUFFER_MAX   = 50;
+const DEBOUNCE_MS  = parseInt(process.env.WA_DEBOUNCE_MS  || '1500', 10);
+const CONTEXT_LIMIT = parseInt(process.env.WA_CONTEXT_LIMIT || '20',   10);
+const MENTION_NAMES = (process.env.WA_MENTION_NAMES || 'Maya,AI').split(',').map(s => s.trim().toLowerCase());
 
 function scheduleReconnect(ms = 5000) {
     if (intentionalStop) return;
@@ -89,15 +131,31 @@ async function startClient(pairingPhone) {
         }
     });
 
+    let authWatchdog = null;
+
     c.on('authenticated', () => {
         console.log('[WA] Authenticated!');
         connectionStatus = 'authenticated';
         pendingPhone = null;
+
+        // Start watchdog: if not Ready within 60 seconds, assume hung and restart silently
+        if (authWatchdog) clearTimeout(authWatchdog);
+        authWatchdog = setTimeout(() => {
+            console.error('[WA] Watchdog triggered: Stuck at loading screen for 60s. Restarting browser silently (No logout)...');
+            if (client) {
+                intentionalStop = true;
+                try { client.destroy(); } catch (_) {}
+                client = null;
+                intentionalStop = false;
+            }
+            scheduleReconnect(2000);
+        }, 60000);
     });
 
     c.on('auth_failure', (msg) => {
         console.error('[WA] Auth failure:', msg);
         connectionStatus = 'disconnected';
+        if (authWatchdog) clearTimeout(authWatchdog);
         if (!intentionalStop) {
             try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
             fs.mkdirSync(AUTH_DIR, { recursive: true });
@@ -109,6 +167,7 @@ async function startClient(pairingPhone) {
         console.log('[WA] Ready! WhatsApp connected.');
         connectionStatus = 'connected';
         pendingPhone = null;
+        if (authWatchdog) clearTimeout(authWatchdog);
     });
 
     // Track delivery status for sent messages (0=pending, 1=sent, 2=received, 3=read, 4=played)
@@ -123,10 +182,101 @@ async function startClient(pairingPhone) {
     c.on('disconnected', (reason) => {
         console.log(`[WA] Disconnected: ${reason} | intentional=${intentionalStop}`);
         connectionStatus = 'disconnected';
-        // Only reconnect if this wasn't triggered by our own destroy() call
-        if (!intentionalStop) {
-            scheduleReconnect(5000);
+        if (!intentionalStop) scheduleReconnect(5000);
+    });
+
+    // ── Incoming Message Listener ─────────────────────────────────────────────
+    c.on('message', async (msg) => {
+        // Hard ignores
+        if (msg.fromMe) return;
+        if (msg.isStatus) return;
+        const chatId = msg.from;
+        if (chatId === 'status@broadcast' || chatId.endsWith('@broadcast')) return;
+
+        const isGroup = chatId.endsWith('@g.us');
+
+        // Sender number (group messages have msg.author, DMs have msg.from)
+        const rawSender = isGroup ? (msg.author || '') : chatId;
+        let senderNumber = rawSender.replace(/@.*$/, '');
+
+        // Skip blocked senders (early check)
+        if (blockedSenders.has(senderNumber)) return;
+
+        // Fetch sender name and real phone number
+        let senderName = senderNumber;
+        try {
+            const contact = await msg.getContact();
+            if (contact.number) senderNumber = contact.number.replace(/@.*$/, '');
+            senderName = contact.name || contact.pushname || senderNumber;
+        } catch (_) {}
+
+        // Skip blocked senders (re-check with real number)
+        if (blockedSenders.has(senderNumber)) return;
+
+        // Fetch group name
+        let groupName = null;
+        if (isGroup) {
+            try {
+                const chat = await msg.getChat();
+                groupName = chat.name || chatId;
+            } catch (_) { groupName = chatId; }
         }
+
+        // ── Buffer message ───────────────────────────────────────────────────
+        if (!messageBuffers[chatId]) messageBuffers[chatId] = [];
+        messageBuffers[chatId].push({ from: senderNumber, name: senderName, body: msg.body, ts: Date.now() });
+        if (messageBuffers[chatId].length > BUFFER_MAX) messageBuffers[chatId].shift();
+
+        // ── Decide whether to trigger notification ───────────────────────────
+        let shouldTrigger = false;
+
+        if (!isGroup) {
+            // Private DM — always trigger
+            shouldTrigger = true;
+        } else {
+            // Group — only trigger on mention or name match
+            const myId = (c.info && c.info.wid) ? c.info.wid._serialized : null;
+            const isMentioned = myId && (msg.mentionedIds || []).includes(myId);
+            const bodyLower   = (msg.body || '').toLowerCase();
+            const nameMatch   = MENTION_NAMES.some(n => bodyLower.includes(n));
+            shouldTrigger = isMentioned || nameMatch;
+        }
+
+        if (!shouldTrigger) return;
+
+        // ── Debounce ─────────────────────────────────────────────────────────
+        if (debounceTimers[chatId]) clearTimeout(debounceTimers[chatId]);
+
+        // Capture values for closure
+        const capturedBody   = msg.body;
+        const capturedNum    = senderNumber;
+        const capturedName   = senderName;
+        const capturedGroup  = groupName;
+        const capturedIsGrp  = isGroup;
+        const capturedKnown  = knownSenders.has(senderNumber);
+
+        debounceTimers[chatId] = setTimeout(() => {
+            delete debounceTimers[chatId];
+
+            // Extract context (all buffered except the last/trigger message)
+            const buf = messageBuffers[chatId] || [];
+            const contextMessages = buf.slice(0, -1).slice(-CONTEXT_LIMIT);
+
+            const uid = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            triggeredQueue.push({
+                id: uid,
+                chatId,
+                isGroup: capturedIsGrp,
+                groupName: capturedGroup,
+                fromNumber: capturedNum,
+                fromName: capturedName,
+                triggerMsg: capturedBody,
+                contextMessages,
+                isKnown: capturedKnown,
+                timestamp: Date.now()
+            });
+            console.log(`[WA-INCOMING] Queued: id=${uid} isGroup=${capturedIsGrp} from=${capturedNum}`);
+        }, DEBOUNCE_MS);
     });
 
     console.log('[WA] Initializing Chrome + WhatsApp Web...');
@@ -145,16 +295,32 @@ startClient(null);
 const server = http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
     if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
+    // API Key Validation
+    const clientIp = req.socket.remoteAddress || 'unknown';
+    const providedKey = req.headers['x-api-key'] || '';
+    const expectedKey = process.env.WA_API_KEY || 'default_maya_key_change_me';
+    
+    if (!safeCompare(providedKey, expectedKey)) {
+        if (!checkAuthRateLimit(clientIp)) {
+            res.writeHead(429, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: "Too many authentication failures" }));
+            return;
+        }
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+    }
+
     async function ensureConnected() {
-        // Both 'connected' and 'authenticated' states can send messages in WhatsApp Web
-        if (connectionStatus === 'connected' || connectionStatus === 'authenticated') return true;
+        // Only allow sending if fully 'connected' (Ready). 'authenticated' means it's still loading.
+        if (connectionStatus === 'connected') return true;
         // If still initializing, wait briefly
         for (let i = 0; i < 10; i++) {
             await new Promise(r => setTimeout(r, 1000));
-            if (connectionStatus === 'connected' || connectionStatus === 'authenticated') return true;
+            if (connectionStatus === 'connected') return true;
         }
         return false;
     }
@@ -405,6 +571,188 @@ const server = http.createServer(async (req, res) => {
             res.writeHead(500, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: err.message }));
         }
+        return;
+    }
+
+    // ── GET /fetch-messages?phone=XXX&limit=10 ─────────────────────────────────────
+    if (req.url.startsWith('/fetch-messages') && req.method === 'GET') {
+        try {
+            if (!(await ensureConnected())) {
+                res.writeHead(503, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: `Not connected (status: ${connectionStatus})` }));
+                return;
+            }
+            const url = new URL(req.url, 'http://127.0.0.1');
+            const raw = url.searchParams.get('phone');
+            if (!raw || typeof raw !== 'string' || raw.length > 20) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: "Invalid phone parameter" }));
+                return;
+            }
+            const num = normalizePhone(raw);
+            const chatId = `${num}@c.us`; // Currently restricted to individuals
+
+            const limitParam = url.searchParams.get('limit');
+            const parsedLimit = Math.min(parseInt(limitParam) || 10, 50);
+
+            let chat;
+            try {
+                chat = await client.getChatById(chatId);
+            } catch (_) {
+                res.writeHead(404, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: "Chat not found or number not on WhatsApp" }));
+                return;
+            }
+
+            const rawMessages = await chat.fetchMessages({ limit: parsedLimit });
+            const messages = [];
+            for (const msg of rawMessages) {
+                let senderName = msg.fromMe ? 'Me' : num;
+                if (!msg.fromMe) {
+                    try {
+                        const contact = await msg.getContact();
+                        senderName = contact.pushname || contact.name || num;
+                    } catch (_) {}
+                }
+                messages.push({
+                    id: msg.id._serialized,
+                    body: msg.body,
+                    fromMe: msg.fromMe,
+                    senderName: senderName,
+                    timestampISO: new Date(msg.timestamp * 1000).toISOString(),
+                    type: msg.type
+                });
+            }
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ success: true, data: messages }));
+        } catch (err) {
+            console.error('[WA fetch-messages] Internal error:', err);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: "Internal server error" }));
+        }
+        return;
+    }
+
+    // ── GET /poll-triggered ───────────────────────────────────────────────────
+    // Python polls this every 2s to get pending incoming messages.
+    if (req.url === '/poll-triggered' && req.method === 'GET') {
+        const items = triggeredQueue.splice(0);   // drain queue atomically
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ items }));
+        return;
+    }
+
+    // ── POST /reply  { chatId, message } ─────────────────────────────────────
+    // Group-safe reply — accepts full chatId (xxx@g.us or xxx@c.us).
+    if (req.url === '/reply' && req.method === 'POST') {
+        let body = '';
+        req.on('data', c => { body += c; });
+        req.on('end', async () => {
+            try {
+                const { chatId: toChatId, message } = JSON.parse(body);
+                if (!toChatId || !message) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: 'Missing chatId or message' }));
+                    return;
+                }
+                if (!(await ensureConnected())) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: `Not connected (status: ${connectionStatus})` }));
+                    return;
+                }
+                console.log(`[WA-INCOMING] Sending reply to chatId=${toChatId}`);
+                await client.sendMessage(toChatId, message);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: true }));
+            } catch (err) {
+                console.error('[WA-INCOMING] Reply error:', err.message);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: err.message }));
+            }
+        });
+        return;
+    }
+
+    // ── POST /register-known  { number } ─────────────────────────────────────
+    if (req.url === '/register-known' && req.method === 'POST') {
+        let body = '';
+        req.on('data', c => { body += c; });
+        req.on('end', () => {
+            try {
+                const { number } = JSON.parse(body);
+                if (number) {
+                    knownSenders.add(String(number));
+                    console.log(`[WA-INCOMING] Registered known sender: ${number}`);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: true }));
+                } else {
+                    res.writeHead(400); res.end(JSON.stringify({ error: 'Missing number' }));
+                }
+            } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: e.message })); }
+        });
+        return;
+    }
+
+    // ── POST /block-number  { number } ───────────────────────────────────────
+    if (req.url === '/block-number' && req.method === 'POST') {
+        let body = '';
+        req.on('data', c => { body += c; });
+        req.on('end', () => {
+            try {
+                const { number } = JSON.parse(body);
+                if (number) {
+                    blockedSenders.add(String(number));
+                    knownSenders.delete(String(number));
+                    console.log(`[WA-INCOMING] Blocked sender: ${number}`);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: true }));
+                } else {
+                    res.writeHead(400); res.end(JSON.stringify({ error: 'Missing number' }));
+                }
+            } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: e.message })); }
+        });
+        return;
+    }
+
+    // ── POST /revoke  { toChatId, count } ─────────────────────────────────────
+    if (req.url === '/revoke' && req.method === 'POST') {
+        let body = '';
+        req.on('data', c => { body += c; });
+        req.on('end', async () => {
+            try {
+                const { toChatId, count } = JSON.parse(body);
+                if (!toChatId) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: 'Missing toChatId' }));
+                    return;
+                }
+                if (!(await ensureConnected())) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: `Not connected` }));
+                    return;
+                }
+                console.log(`[WA] Fetching messages for ${toChatId} to revoke...`);
+                const chat = await client.getChatById(toChatId);
+                const messages = await chat.fetchMessages({ limit: 50 });
+                let revoked = 0;
+                const targetCount = count || 1;
+                for (let i = messages.length - 1; i >= 0; i--) {
+                    if (messages[i].fromMe) {
+                        await messages[i].delete(true); // true = delete for everyone
+                        revoked++;
+                        if (revoked >= targetCount) break;
+                        await new Promise(r => setTimeout(r, 800));
+                    }
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: true, revoked }));
+            } catch (err) {
+                console.error('[WA] Revoke error:', err.message);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: err.message }));
+            }
+        });
         return;
     }
 

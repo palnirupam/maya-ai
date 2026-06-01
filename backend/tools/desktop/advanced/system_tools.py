@@ -242,6 +242,60 @@ def whatsapp_call(contact_name: str) -> str:
     """
     return f"ERROR: WhatsApp voice or video calling is not supported via the background service. Please send a text message instead to '{contact_name}'."
 
+def read_whatsapp_chat(contact_name_or_phone: str, limit: int = 10) -> str:
+    """
+    Reads the most recent WhatsApp messages from a specific contact.
+    Use this to read chat history or check if someone sent a new message.
+    Args:
+        contact_name_or_phone (str): The exact phone number OR the name of the contact.
+        limit (int): Number of recent messages to fetch (default is 10).
+    Returns:
+        str: A formatted string of recent messages with ISO timestamps and sender names.
+    """
+    from backend.tools.desktop.advanced.contacts import lookup_contact
+    from backend.tools.desktop.advanced.whatsapp_manager import whatsapp_manager
+    
+    # Try fuzzy matching first if it does not look like a raw number
+    phone = contact_name_or_phone.strip()
+    clean_digits = phone.replace('+', '').replace(' ', '').replace('-', '')
+    
+    if not clean_digits.isdigit():
+        match = lookup_contact(contact_name_or_phone)
+        if match:
+            phone = match["phone"]
+        else:
+            return f"ERROR: Contact '{contact_name_or_phone}' not found in database and is not a valid phone number."
+            
+    # Check status
+    status = whatsapp_manager.get_status()
+    if status.get("status") not in ["connected", "authenticated"]:
+        if status.get("hasQr"):
+            return f"ERROR: WhatsApp is not connected. A pairing QR code has been generated. Please scan the QR code to connect."
+        return f"ERROR: WhatsApp is not connected (status: {status.get('status')})."
+
+    # Fetch messages
+    result = whatsapp_manager.fetch_messages(phone, limit=limit)
+    if not result.get("success"):
+        return f"ERROR fetching messages: {result.get('error', 'Unknown error')}"
+        
+    data = result.get("data", [])
+    if not data:
+        return f"No recent messages found with '{contact_name_or_phone}'."
+        
+    formatted = []
+    for msg in data:
+        sender = "You" if msg.get("fromMe") else msg.get("senderName", contact_name_or_phone)
+        body = msg.get("body", "<Media/Unsupported>")
+        time_iso = msg.get("timestampISO", "")
+        # Extract time for readability HH:MM
+        try:
+            time_str = time_iso.split('T')[1][:5]
+        except Exception:
+            time_str = ""
+        formatted.append(f"{sender} ({time_str}): {body}")
+        
+    return "\n".join(formatted)
+
 def whatsapp_send_message(contact_name: str, message: str) -> str:
     """
     Sends a WhatsApp message to a contact in the SQLite contacts database via Baileys background service.
@@ -260,15 +314,49 @@ def whatsapp_send_message(contact_name: str, message: str) -> str:
     
     # Check status
     status = whatsapp_manager.get_status()
-    if status.get("status") not in ["connected", "authenticated"]:
-        if status.get("hasQr"):
-            return f"ERROR: WhatsApp is not connected. A pairing QR code has been generated. Please scan the QR code to connect. If you are on Telegram, send /whatsapp_qr to view and scan the QR code."
-        return "ERROR: WhatsApp is not connected. Please pair your account first by scanning the QR code."
+    if status.get("status") != "connected":
+        return "ERROR: WhatsApp is not connected (or is still loading). Please pair your account first by sending the command `/wa +91<your_number>` in Telegram. DO NOT tell the user to scan a QR code."
         
     success = whatsapp_manager.send_message(phone, message)
     if success:
         return f"SUCCESS: Sent WhatsApp message to '{match['name']}' ({phone}): {message}"
     return f"ERROR: Failed to send WhatsApp message to '{match['name']}' ({phone}) via background service."
+
+def whatsapp_revoke_message(contact_name: str, count: int = 1) -> str:
+    """
+    Revokes (Deletes for Everyone) the most recent messages you sent to a contact.
+    Args:
+        contact_name (str): The name of the contact (e.g. 'Pintu') or phone number.
+        count (int): The number of recent messages to delete (default 1).
+    """
+    from backend.tools.desktop.advanced.contacts import lookup_contact
+    from backend.tools.desktop.advanced.whatsapp_manager import whatsapp_manager
+    import re
+    
+    phone = None
+    display_name = contact_name
+    if re.fullmatch(r'[\d\s\-\+]{7,15}', contact_name.strip()):
+        clean_num = re.sub(r'[^\d]', '', contact_name.strip())
+        if len(clean_num) == 10:
+            phone = "91" + clean_num
+        elif len(clean_num) >= 11:
+            phone = clean_num
+    
+    if phone is None:
+        match = lookup_contact(contact_name)
+        if not match:
+            return f"ERROR: Contact '{contact_name}' not found in database."
+        phone = match["phone"]
+        display_name = match["name"]
+
+    status = whatsapp_manager.get_status()
+    if status.get("status") not in ["connected", "authenticated"]:
+        return "ERROR: WhatsApp is not connected. Please pair your account first."
+        
+    success = whatsapp_manager.revoke_messages(phone, count)
+    if success:
+        return f"SUCCESS: Revoked {count} recent WhatsApp message(s) sent to '{display_name}' ({phone})."
+    return f"ERROR: Failed to revoke WhatsApp messages for '{display_name}' ({phone}). They might be too old or not sent by you."
 
 def whatsapp_get_pairing_code(phone: str) -> str:
     """

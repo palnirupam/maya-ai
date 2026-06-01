@@ -10,11 +10,11 @@ from ...tools.desktop.advanced.google_classroom_tools import classroom_list_assi
 from ...tools.desktop.app_context import get_app_context
 from ...tools.desktop.advanced.file_system_tools import create_file, read_file, list_directory, delete_file, search_local_files
 from ...tools.desktop.advanced.terminal_tools import execute_powershell, execute_python
-from ...tools.desktop.advanced.system_tools import get_active_windows, change_volume, read_clipboard, write_clipboard, get_system_stats, manage_processes, read_on_screen_text, whatsapp_call, whatsapp_send_message, whatsapp_get_pairing_code, whatsapp_send_file, whatsapp_send_multiple_files, pause_media, setup_missing_tool
+from ...tools.desktop.advanced.system_tools import get_active_windows, change_volume, read_clipboard, write_clipboard, get_system_stats, manage_processes, read_on_screen_text, whatsapp_call, whatsapp_send_message, whatsapp_revoke_message, whatsapp_get_pairing_code, whatsapp_send_file, whatsapp_send_multiple_files, read_whatsapp_chat, pause_media, setup_missing_tool
 from ...tools.desktop.advanced.youtube_player import play_youtube_background, stop_youtube_background
 from ...tools.desktop.advanced.vision_tools import find_and_click, wait_for_element, read_active_window_title, is_app_open, take_verified_screenshot
 from ...tools.desktop.advanced.memory_tools import remember_fact, recall_facts, forget_fact, schedule_reminder, configure_gmail_credentials
-from ...tools.desktop.advanced.contacts import save_contact, get_contact_number
+from ...tools.desktop.advanced.contacts import save_contact, get_contact_number, delete_contact
 from ...tools.desktop.shortcuts import perform_shortcut, control_brightness, control_display, manage_window
 from ...tools.web.search import web_search
 from ...tools.desktop.advanced.computer_use import background_app_control, vision_guided_action
@@ -72,6 +72,7 @@ def manage_system_state(action: str) -> str:
     Control the state of the AI assistant application itself.
     Args:
         action (str): Must be either 'shutdown' (to completely close and exit the application) or 'sleep' (to put the app in standby mode).
+    NOTE: This only works from the Maya desktop app. Via Telegram, user must approve from the app.
     """
     return f"SYSTEM_STATE_TRIGGERED:{action}"
 
@@ -79,7 +80,7 @@ def change_interaction_mode(mode: str) -> str:
     """
     Switch the runtime mode and capability profile of the AI assistant.
     Args:
-        mode (str): Must be 'coding', 'companion', 'professional', or 'friendly'.
+        mode (str): Must be 'coding', 'professional', or 'friendly'.
     """
     return f"MODE_CHANGE_TRIGGERED:{mode}"
 
@@ -98,12 +99,13 @@ CAPABILITY_MAP = {
         open_app, close_app, focus_app, list_open_apps,
         get_active_windows, change_volume, read_clipboard, write_clipboard,
         get_system_stats, manage_processes, read_on_screen_text,
-        whatsapp_call, whatsapp_send_message, whatsapp_get_pairing_code,
-        whatsapp_send_file, whatsapp_send_multiple_files,
+        whatsapp_call, whatsapp_send_message, whatsapp_revoke_message, whatsapp_get_pairing_code,
+        whatsapp_send_file, whatsapp_send_multiple_files, read_whatsapp_chat,
         pause_media, setup_missing_tool,
         find_and_click, wait_for_element, read_active_window_title,
         is_app_open, take_verified_screenshot,
         play_youtube_background, stop_youtube_background,
+        delete_contact,
     ],
     "PERM_WEB_SEARCH": [web_search]
 }
@@ -145,36 +147,15 @@ def get_maya_tools() -> list:
     finally:
         db.close()
         
-    # Load external plugins securely
-    import os
-    import importlib.util
-    from pathlib import Path
+    # ── Dynamic Skills (hot-reloaded by skill_watcher) ───────────────────────
+    # get_dynamic_tools() is thread-safe (guarded by _registry_lock inside watcher)
     try:
-        from ...skills.loader import verify_and_load_plugin
-        skills_dir = Path("backend/skills")
-        if skills_dir.exists() and skills_dir.is_dir():
-            for plugin_file in skills_dir.glob("*.py"):
-                if plugin_file.name in ["__init__.py", "scanner.py", "loader.py"]:
-                    continue
-                if verify_and_load_plugin(plugin_file):
-                    try:
-                        spec = importlib.util.spec_from_file_location(plugin_file.stem, plugin_file)
-                        module = importlib.util.module_from_spec(spec)
-                        spec.loader.exec_module(module)
-                        # Extract all callable functions defined in the plugin
-                        for attr_name in dir(module):
-                            if not attr_name.startswith("_"):
-                                attr = getattr(module, attr_name)
-                                if callable(attr) and hasattr(attr, "__name__"):
-                                    # Ensure it's not an imported function
-                                    if getattr(attr, "__module__", None) == plugin_file.stem:
-                                        tools.append(attr)
-                    except Exception as e:
-                        logger.error(f"Error executing plugin {plugin_file.name}: {e}")
+        from backend.skills.skill_watcher import get_dynamic_tools
+        tools.extend(get_dynamic_tools())
     except ImportError:
         pass
-        
-    # Deduplicate tools by function name to avoid 400 errors from API providers like DeepSeek
+
+    # Deduplicate tools by function name to avoid 400 errors from API providers
     seen_names = set()
     unique_tools = []
     for tool in tools:
@@ -185,5 +166,6 @@ def get_maya_tools() -> list:
                 unique_tools.append(tool)
         else:
             unique_tools.append(tool)
-            
+
     return unique_tools
+

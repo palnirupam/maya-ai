@@ -47,12 +47,22 @@ def startup_event():
         asyncio.create_task(maya_scheduler.start())
     except Exception as e:
         logging.error(f"Error starting Scheduler: {e}")
+    try:
+        from backend.skills.skill_watcher import start_skill_watcher
+        start_skill_watcher()
+    except Exception as e:
+        logging.error(f"Error starting Skill Watcher: {e}")
+    try:
+        from backend.skills.md_loader import start_md_skill_loader
+        start_md_skill_loader()
+    except Exception as e:
+        logging.error(f"Error starting MD Skill Loader: {e}")
 
 @app.on_event("shutdown")
-def shutdown_event():
+async def shutdown_event():
     try:
         from backend.api.telegram_bot import telegram_bot_manager
-        telegram_bot_manager.stop()
+        await telegram_bot_manager.stop()
     except Exception as e:
         logging.error(f"Error stopping Telegram Bot: {e}")
     try:
@@ -66,7 +76,31 @@ def shutdown_event():
         asyncio.create_task(maya_scheduler.stop())
     except Exception as e:
         logging.error(f"Error stopping Scheduler: {e}")
+    try:
+        from backend.skills.skill_watcher import stop_skill_watcher
+        stop_skill_watcher()
+    except Exception as e:
+        logging.error(f"Error stopping Skill Watcher: {e}")
+    try:
+        from backend.skills.md_loader import stop_md_skill_loader
+        stop_md_skill_loader()
+    except Exception as e:
+        logging.error(f"Error stopping MD Skill Loader: {e}")
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "Maya AI Backend is running. WhatsApp connection fix applied successfully."}
+    return {"status": "ok", "message": "Maya AI Backend is running."}
+
+@app.get("/skills")
+def list_skills():
+    """Debug endpoint — shows all loaded SKILL.md skills."""
+    try:
+        from backend.skills.md_loader import get_loaded_skills, MD_SKILLS_REGISTRY
+        skills = get_loaded_skills()
+        return {
+            "status": "ok",
+            "count": len(skills),
+            "skills": skills,
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}

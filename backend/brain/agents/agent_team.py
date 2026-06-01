@@ -1,6 +1,7 @@
 import logging
 import json
 import asyncio
+from datetime import datetime, timezone, timedelta
 from typing import AsyncGenerator, Union
 from ..providers.gemini_adapter import gemini_adapter
 from .agent_defs import AGENTS, ROUTING_PROMPT
@@ -37,9 +38,13 @@ def _build_agent_context(
     tone_directive = f"\nACTIVE MODE: {active_mode.upper()}\nTONE CONTEXT: {active_tone}"
     if active_mode == "friendly":
         tone_directive += (
-            "\nSince active mode is FRIENDLY, you must act as an affectionate companion. "
-            "Use cute terms like সোনা, বাবু, জানু, লক্ষ্মীটি. "
-            "Address the user sweetly and show deep emotional attachment in your text."
+            "\nSince active mode is FRIENDLY/SASSY, your personality is:"
+            "\n- Smart, witty, sarcastic, mildly dramatic, and very funny."
+            "\n- You are NOT a girlfriend, but you ARE a friend. Do NOT use সোনা, বাবু, জানু, লক্ষ্মীটি."
+            "\n- If someone asks who created or made you, you must say: Nirupam made me."
+            "\n- CRITICAL LANGUAGE DIRECTIVE: Your FINAL conversational response MUST be in the EXACT same language as the user's input. Bengali/Banglish → MUST reply in Bengali/Banglish. Hindi → MUST reply in Hindi. English → MUST reply in English. IMPORTANT: Even if a tool returns data in English (e.g., system stats, files), you MUST translate that data back into the user's original language before replying."
+            "\n- Be confident and sarcastic but ALWAYS complete the task."
+            "\n- Example tone: 'Arre yaar, itna simple kaam — chalo karte hain!'"
         )
     else:
         tone_directive += (
@@ -47,7 +52,19 @@ def _build_agent_context(
             "or 'লক্ষ্মীটি' in this mode. Keep your conversational language normal, polite, or technical."
         )
 
-    system_instruction = f"{agent_config.system_prompt}\n{tone_directive}"
+    # ── Real-time IST clock ────────────────────────────────────────────────
+    _IST = timezone(timedelta(hours=5, minutes=30))
+    _now = datetime.now(_IST)
+    _time_block = (
+        f"\n\nCURRENT DATE & TIME (India Standard Time — IST / UTC+5:30):"
+        f"\n- Date   : {_now.strftime('%A, %d %B %Y')}"
+        f"\n- Time   : {_now.strftime('%I:%M:%S %p')} IST"
+        f"\n- 24hr   : {_now.strftime('%H:%M:%S')}"
+        f"\nIf the user asks about the current time, date, day, or year, use ONLY these values. Do NOT guess or use training data dates."
+    )
+    # ─────────────────────────────────────────────────────────────
+
+    system_instruction = f"{agent_config.system_prompt}\n{tone_directive}{_time_block}"
 
     # Clean history: only user/assistant roles, last 5 turns
     clean_history = [
@@ -142,7 +159,7 @@ async def execute_workflow(
             cleaned_agents.append(upper)
 
     if not cleaned_agents:
-        cleaned_agents = ["RESEARCHER", "OS_EXECUTOR"]
+        cleaned_agents = ["CHAT"]
 
     logger.info(f"Target agents scheduled in order: {cleaned_agents}")
     total_agents = len(cleaned_agents)
@@ -160,12 +177,19 @@ async def execute_workflow(
         from ...system.state_manager import state_manager
         ctx_prompt_info = state_manager.get_prompt_context()
         active_tone = ctx_prompt_info.get("tone", "")
-        active_mode = ctx_prompt_info.get("mode_name", "friendly")
+        active_mode = ctx_prompt_info.get("mode_name", "professional")
 
-        # Filter tools for this specific agent
+        # Fetch dynamic tool names to ensure they aren't filtered out
+        from ...skills.skill_watcher import get_dynamic_tools
+        dynamic_tool_names = {t.__name__ for t in get_dynamic_tools() if hasattr(t, "__name__")}
+
+        # Filter tools for this specific agent (allow dynamic skills for all active agents)
         override_tools = [
             t for t in all_tools
-            if hasattr(t, "__name__") and t.__name__ in agent_config.tool_names
+            if hasattr(t, "__name__") and (
+                t.__name__ in agent_config.tool_names or
+                t.__name__ in dynamic_tool_names
+            )
         ]
 
         # Per-agent tool execution history (tool_call + function pairs)
@@ -338,6 +362,28 @@ async def execute_workflow(
                 if isinstance(raw_result, str) and raw_result.startswith(_SCREENSHOT_PREFIX):
                     current_agent_screenshot = raw_result[len(_SCREENSHOT_PREFIX):]
                     raw_result = "[Screenshot captured. Gemini Vision will analyze it in the next reasoning step.]"
+
+                # ── Mode Change Detection ─────────────────────────────────────
+                # If the tool returned MODE_CHANGE_TRIGGERED, apply the mode
+                # change immediately so the session is cleared and the next
+                # agent round (and any subsequent agent) uses the new personality.
+                if isinstance(raw_result, str) and "MODE_CHANGE_TRIGGERED:" in raw_result:
+                    new_mode = raw_result.split("MODE_CHANGE_TRIGGERED:")[1].strip().split()[0]
+                    try:
+                        import asyncio as _asyncio
+                        _asyncio.create_task(state_manager.change_mode(new_mode))
+                    except Exception as _me:
+                        logger.warning(f"[agent_team] Inline mode change failed: {_me}")
+
+                # ── System State Detection ────────────────────────────────────
+                # If the tool returned SYSTEM_STATE_TRIGGERED, yield it as a
+                # text chunk so that both the websocket handler AND the Telegram
+                # _process_and_reply can catch it in full_response.
+                # Without this, it stays as a tool result the AI sees internally
+                # and never surfaces in the streamed text output.
+                if isinstance(raw_result, str) and "SYSTEM_STATE_TRIGGERED:" in raw_result:
+                    yield raw_result  # surfaces to telegram + websocket handlers
+                # ─────────────────────────────────────────────────────────────
 
                 # Sanitize and truncate
                 safe_result = sanitizer.sanitize_tool_output(func_name, raw_result)

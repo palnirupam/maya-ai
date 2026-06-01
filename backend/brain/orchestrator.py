@@ -20,16 +20,31 @@ class ConversationOrchestrator:
             from .personality.maya_personality import prompt_builder
             from .memory.long_term_memory import build_memory_context_block
             from ..system.state_manager import state_manager
-            
+
             system_prompt = prompt_builder.get_system_prompt()
             memory_block = build_memory_context_block(
-                active_category=state_manager.state.active_mode, 
+                active_category=state_manager.state.active_mode,
                 context_text=initial_context
             )
-            
+
             if memory_block:
                 system_prompt += "\n" + memory_block
-                
+
+            # ── Inject SKILL.md skills into system prompt ─────────────────────
+            # Skills teach Maya new multi-step workflows without touching
+            # the core personality file. Skills load from:
+            #   backend/skills/builtin/   (shipped with Maya)
+            #   backend/skills/user_skills/ (user-created)
+            try:
+                from backend.skills.md_loader import get_skills_prompt_block
+                skills_block = get_skills_prompt_block()
+                if skills_block:
+                    system_prompt += "\n" + skills_block
+                    logger.debug(f"[Orchestrator] Injected skills block into session '{session_id}'")
+            except Exception as exc:
+                logger.warning(f"[Orchestrator] Skills injection skipped: {exc}")
+            # ─────────────────────────────────────────────────────────────────
+
             self.sessions[session_id] = [
                 {"role": "system", "content": system_prompt}
             ]

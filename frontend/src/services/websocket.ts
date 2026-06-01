@@ -8,6 +8,8 @@ class AudioQueue {
   private audioCtx: AudioContext | null = null;
   private nextStartTime: number = 0;
   private activeSources: AudioBufferSourceNode[] = [];
+  
+  public onQueueEmpty?: () => void;
 
   private initAudioContext() {
     if (!this.audioCtx) {
@@ -38,6 +40,7 @@ class AudioQueue {
       setTimeout(() => {
         if (!this.isPlaying && this.queue.length === 0) {
           useAssistantStore.getState().setAppState('idle');
+          if (this.onQueueEmpty) this.onQueueEmpty();
         }
       }, 300);
       return;
@@ -109,9 +112,32 @@ class WebSocketClient {
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
   private audioQueue = new AudioQueue();
+  private listeners: Map<string, Set<(payload: any) => void>> = new Map();
 
   constructor(url: string) {
     this.url = url;
+    this.audioQueue.onQueueEmpty = () => {
+      this.emit('audio_ended', {});
+    };
+  }
+
+  on(event: string, callback: (payload: any) => void) {
+    if (!this.listeners.has(event)) {
+      this.listeners.set(event, new Set());
+    }
+    this.listeners.get(event)!.add(callback);
+  }
+
+  off(event: string, callback: (payload: any) => void) {
+    if (this.listeners.has(event)) {
+      this.listeners.get(event)!.delete(callback);
+    }
+  }
+
+  private emit(event: string, payload?: any) {
+    if (this.listeners.has(event)) {
+      this.listeners.get(event)!.forEach(cb => cb(payload));
+    }
   }
 
   connect() {
@@ -155,6 +181,7 @@ class WebSocketClient {
 
   private handleEvent(type: string, payload: any) {
     const store = useAssistantStore.getState();
+    this.emit(type, payload);
 
     switch (type) {
       case 'status_update':

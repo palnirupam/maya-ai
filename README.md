@@ -23,7 +23,9 @@ Maya bridges the gap between your desktop and mobile phone with native integrati
 * 🤖 **Telegram Remote Control:** Command your laptop from anywhere via a secure Telegram Bot.
   * ⚠️ **Dangerous Command Guard:** Prompts with interactive Yes/No buttons before executing risky operations like shutting down the PC.
   * 🚨 **🛑 Emergency Kill Switch:** Features a prominent, red **Emergency Stop** button at the very top of the Telegram bot keyboard! Tapping the button or sending `STOP`, `HALT`, `PANIC` instantly interrupts and kills any running orchestrator task or runaway automation in the backend, ensuring 100% host safety.
-* 💬 **WhatsApp Integration:** Background headless `whatsapp-web.js` service allows Maya to send/receive messages on your behalf with automatic number verification.
+* 💬 **WhatsApp Integration:** 
+  * 📨 **Background Message Reading & Sending:** Maya natively reads recent WhatsApp chats and summarizes them via the background service. You can ask *"Did Pintu send any new messages?"* straight from Telegram without opening your PC.
+  * 🔒 **Zero-Config Auto-Auth Security:** Features an enterprise-grade dynamic token injection. A cryptographically secure 64-character key (`secrets.token_hex`) is generated in memory, securely shared via atomic Temp files (`icacls` restricted), and injected directly into the Node.js subprocess. No `.env` manual setups required—100% robust and hack-proof out of the box!
 * 📬 **Headless Background Emailer:** Send secure emails completely in the background via SMTP (Gmail) using AES-GCM encrypted credentials. Fully supports **file attachments** (send any PDF, image, or document from your PC remotely).
 * 🔍 **Recursive PC File Search:** Locates any file on your hard drives in seconds. Highly optimized to skip heavy system/dependency folders (like `AppData`, `node_modules`, `.git`) for fast, crash-free indexing.
 * ⚡ **Lightning Fast Routing:** Optimized Gemini API adapters auto-route between `gemini-3.5-flash` and `gemini-2.5-flash` for sub-3-second mobile replies.

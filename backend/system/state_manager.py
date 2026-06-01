@@ -7,10 +7,10 @@ from ..brain.personality.modes.registry import MODES, CAPABILITY_PROFILES
 logger = logging.getLogger(__name__)
 
 class AssistantState(BaseModel):
-    active_mode: str = "companion"
+    active_mode: str = "professional"
     active_theme: str = "purple"
-    capability_profile: str = "restricted_automation"
-    capabilities: Set[str] = set(CAPABILITY_PROFILES["restricted_automation"])
+    capability_profile: str = "full_automation"
+    capabilities: Set[str] = set(CAPABILITY_PROFILES["full_automation"])
     emotional_state: str = "focused"
     session_flags: Dict[str, str] = {}
     runtime_status: str = "awake"
@@ -37,7 +37,16 @@ class StateManager:
         self.state.capabilities = set(CAPABILITY_PROFILES.get(cap_profile, []))
         
         logger.info(f"[StateManager] Mode changed to '{new_mode}' | Capabilities: {self.state.capabilities}")
-        
+
+        # ── Clear all cached sessions so new personality applies immediately ──
+        try:
+            from ..brain.orchestrator import orchestrator
+            orchestrator.sessions.clear()
+            logger.info(f"[StateManager] All sessions cleared — new personality active.")
+        except Exception as e:
+            logger.warning(f"[StateManager] Could not clear sessions: {e}")
+        # ────────────────────────────────────────────────────────────────────
+
         # Emit Event
         await system_event_bus.publish("MODE_CHANGED", {
             "mode": new_mode,
@@ -48,7 +57,7 @@ class StateManager:
         
     def get_prompt_context(self) -> dict:
         """Returns the context needed for the PromptBuilder."""
-        mode_config = MODES.get(self.state.active_mode, MODES["companion"])
+        mode_config = MODES.get(self.state.active_mode, MODES["professional"])
         
         # Load user toggles from database to align prompt capabilities
         caps = set(self.state.capabilities)

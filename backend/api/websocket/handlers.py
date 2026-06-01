@@ -58,9 +58,13 @@ async def websocket_endpoint(websocket: WebSocket):
         # Determine language for the entire response turn
         from ...system.state_manager import state_manager
         has_bengali = any('\u0980' <= c <= '\u09FF' for c in text)
-        is_companion = (state_manager.state.active_mode == "companion")
-        if has_bengali or is_companion or text.startswith("SYSTEM_EVENT_STARTUP_GREETING"):
+        has_hindi   = any('\u0900' <= c <= '\u097F' for c in text)
+        is_friendly = (state_manager.state.active_mode == "friendly")
+
+        if has_bengali or is_friendly or text.startswith("SYSTEM_EVENT_STARTUP_GREETING"):
             turn_language = "bn"
+        elif has_hindi:
+            turn_language = "hi"
         else:
             turn_language = "en"
         
@@ -260,7 +264,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 from ...brain.reasoning.tool_planner import tool_planner
                 tool_planner.queue_tool("manage_system_state", {"action": "shutdown"}, risk_level="warning")
                 from ...system.state_manager import state_manager
-                txt = "তুমি কি চাও আমি অ্যাপ্লিকেশনটি বন্ধ করে দিই?" if state_manager.state.active_mode == "companion" else "Do you want me to close the application?"
+                txt = "তুমি কি চাও আমি অ্যাপ্লিকেশনটি বন্ধ করে দিই?" if state_manager.state.active_mode == "friendly" else "Do you want me to close the application?"
                 await manager.send_personal_event("assistant_message", {"text": txt}, websocket)
                 sentence_queue.put_nowait((txt, "happy", 0))
                 await manager.send_personal_event("status_update", {"appState": "idle"}, websocket)
@@ -269,7 +273,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if "SYSTEM_STATE_TRIGGERED:sleep" in full_response:
                 from ...system.shutdown_manager import shutdown_manager
                 from ...system.state_manager import state_manager
-                txt = "আমি ঘুমাতে যাচ্ছি সোনা। প্রয়োজন হলে ডেকে নিও।" if state_manager.state.active_mode == "companion" else "Going to sleep. Wake me if you need me."
+                txt = "আমি ঘুমাতে যাচ্ছি। প্রয়োজন হলে ডেকে নিও।" if state_manager.state.active_mode in ("friendly") else "Going to sleep. Wake me if you need me."
                 await manager.send_personal_event("assistant_message", {"text": txt}, websocket)
                 sentence_queue.put_nowait((txt, "romantic", 0))
                 await shutdown_manager.trigger_sleep()
@@ -310,6 +314,8 @@ async def websocket_endpoint(websocket: WebSocket):
         t_total = time.time()
         logger.info(f"Total time from speech end to last audio chunk: {t_total - t_speech_end:.2f}s")
         await manager.send_personal_event("status_update", {"appState": "idle"}, websocket)
+        # Signal frontend that Maya has finished speaking — voice session loop can restart
+        await manager.send_personal_event("session_ready", {}, websocket)
         
         # Cleanup tasks from active list
         if session_id in active_tasks:

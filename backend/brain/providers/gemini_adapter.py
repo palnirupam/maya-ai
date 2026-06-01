@@ -309,8 +309,8 @@ class GeminiAdapter(LLMProvider):
         if last_error:
             logger.error(f"Custom LLM API Error after trying all models: {last_error}")
         from ...system.state_manager import state_manager
-        if state_manager.state.active_mode == "companion":
-            return "দুঃখিত সোনা, আমার একটু সমস্যা হচ্ছে।"
+        if state_manager.state.active_mode in ("friendly", "companion"):
+            return "দুঃখিত, আমার একটু সমস্যা হচ্ছে।"
         return "I'm sorry, I encountered an error while processing that."
 
     async def generate_custom_stream(self, context: list[dict], tools: list) -> AsyncGenerator[str, None]:
@@ -429,8 +429,8 @@ class GeminiAdapter(LLMProvider):
                         logger.error(f"Could not read HTTP error response: {read_err}")
                 logger.error(f"Custom LLM Stream Error: {last_error}")
                 from ...system.state_manager import state_manager
-                if state_manager.state.active_mode == "companion":
-                    yield " দুঃখিত সোনা, আমার একটু সমস্যা হচ্ছে।"
+                if state_manager.state.active_mode in ("friendly", "companion"):
+                    yield " দুঃখিত, আমার একটু সমস্যা হচ্ছে।"
                 else:
                     yield " I'm sorry, I encountered an error while thinking."
         

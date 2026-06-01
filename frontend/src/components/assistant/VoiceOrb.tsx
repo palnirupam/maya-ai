@@ -44,6 +44,14 @@ export const VoiceOrb: React.FC = () => {
       boxShadow: `0 0 60px rgba(74, 222, 128, 0.6)`,
       transition: { duration: 1.5, repeat: Infinity, ease: "easeInOut", backgroundColor: { duration: 0.5 } }
     },
+    // User is actively speaking — brighter green, stronger pulse
+    recording: {
+      scale: [1, 1.18, 1.05, 1.2, 1],
+      opacity: [0.85, 1, 0.9, 1, 0.85],
+      backgroundColor: "rgba(34, 197, 94, 0.85)",
+      boxShadow: `0 0 90px rgba(34, 197, 94, 0.7)`,
+      transition: { duration: 0.4, repeat: Infinity, ease: "easeInOut", backgroundColor: { duration: 0.3 } }
+    },
     thinking: {
       rotate: 360,
       scale: [1, 1.05, 1],
