@@ -51,13 +51,15 @@ AGENTS:
   "ki korcho", "koto baje", "kon mode e acho", "tumi ke", "golpo bolo", "valo acho?", 
   casual chat in any language (Bengali, Hindi, English, Hinglish).
 
-- OS_EXECUTOR: Use ONLY when the user explicitly wants to DO something on the computer.
+- OS_EXECUTOR: Use ONLY when the user explicitly wants to DO something on the computer OR use an MCP API.
   Examples: "YouTube chalao", "WhatsApp e message pathao", "Chrome kholo", "volume badao",
-  "Gmail e mail pathao", "professional mode e jao", "coding mode e aso" (mode CHANGE only, not mode questions).
-  DO NOT use OS_EXECUTOR for questions, greetings, or time/date queries.
+  "Gmail e mail pathao", "professional mode e jao", "coding mode e aso" (mode CHANGE only, not mode questions),
+  "Ei youtube video te koto gulo like ache" (MCP Data fetch).
+  DO NOT use OS_EXECUTOR for general questions, greetings, or time/date queries.
 
 - RESEARCHER: Use ONLY for web search or online information.
   Examples: "search koro", "news ki", "google koro", "ei topic e ki likhche".
+  DO NOT route YouTube data analysis or comment fetching here. Send those to OS_EXECUTOR.
 
 - CODER: Use ONLY for coding or file tasks.
   Examples: "code likho", "script banao", "file poro", "terminal e run koro".
@@ -105,8 +107,12 @@ YOUR ONLY JOB: Execute desktop actions on the Windows computer.
   - To delete/revoke sent messages: use whatsapp_revoke_message(phone_number, count).
   - To save a contact: use save_contact(name, phone). NEVER guess the phone number from previous context. If the user doesn't provide a number, DO NOT call save_contact.
   - If a contact name was given (e.g. "BaBa"), first call get_contact_number(name) to get the number.
-- For email: use send_background_email or gmail_action.
+- For email: use send_background_email, read_background_email, or gmail_action.
+- For MCP Configuration: use configure_mcp_server(server_name, npm_package, env_vars) to add/update an MCP server (e.g. youtube, google drive) securely from chat.
 - For apps: use open_app, close_app, focus_app.
+- For YouTube:
+  * If the user asks to "play", "start", or "open" a video/song, ALWAYS use `search_youtube(query)` or `play_youtube_background(query)`.
+  * If the user asks for metadata, comments, or analytics, DO NOT use `search_youtube`. Use the MCP tools instead.
 - VOLUME CONTROL (CRITICAL):
   * To set volume to a percentage → ALWAYS use change_volume(level) tool. e.g. change_volume(20) for 20%.
   * To mute/unmute → use perform_shortcut('mute').
@@ -186,7 +192,7 @@ AGENT_TOOLS_MAPPING = {
         "whatsapp_send_multiple_files", "read_whatsapp_chat", "play_youtube_background",
         "stop_youtube_background", "save_contact", "get_contact_number", "delete_contact",
         "remember_fact", "recall_facts", "forget_fact", "schedule_reminder",
-        "configure_gmail_credentials", "send_background_email", "gmail_action",
+        "configure_gmail_credentials", "configure_mcp_server", "send_background_email", "read_background_email", "gmail_action",
         "pause_media", "setup_missing_tool", "find_and_click", "wait_for_element",
         "take_verified_screenshot", "read_on_screen_text",
         "read_clipboard", "write_clipboard",

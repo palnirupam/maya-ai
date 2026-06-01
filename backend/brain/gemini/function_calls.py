@@ -3,7 +3,7 @@ from ...tools.desktop.keyboard import keyboard_tools
 from ...vision.capture.screen_capture import screen_capture
 
 from ...tools.desktop.apps import open_app, close_app, focus_app, list_open_apps
-from ...tools.desktop.advanced.browser_tools import open_url, search_youtube, search_google, gmail_action, send_background_email
+from ...tools.desktop.advanced.browser_tools import open_url, search_youtube, search_google, gmail_action, send_background_email, read_background_email
 from ...tools.desktop.advanced.playwright_browser import playwright_navigate, playwright_click, playwright_type, playwright_screenshot, playwright_get_content, playwright_close, playwright_upload_file
 from ...tools.desktop.advanced.google_meet_tools import google_meet_join, google_meet_leave
 from ...tools.desktop.advanced.google_classroom_tools import classroom_list_assignments, classroom_upload_file
@@ -13,7 +13,7 @@ from ...tools.desktop.advanced.terminal_tools import execute_powershell, execute
 from ...tools.desktop.advanced.system_tools import get_active_windows, change_volume, read_clipboard, write_clipboard, get_system_stats, manage_processes, read_on_screen_text, whatsapp_call, whatsapp_send_message, whatsapp_revoke_message, whatsapp_get_pairing_code, whatsapp_send_file, whatsapp_send_multiple_files, read_whatsapp_chat, pause_media, setup_missing_tool
 from ...tools.desktop.advanced.youtube_player import play_youtube_background, stop_youtube_background
 from ...tools.desktop.advanced.vision_tools import find_and_click, wait_for_element, read_active_window_title, is_app_open, take_verified_screenshot
-from ...tools.desktop.advanced.memory_tools import remember_fact, recall_facts, forget_fact, schedule_reminder, configure_gmail_credentials
+from ...tools.desktop.advanced.memory_tools import remember_fact, recall_facts, forget_fact, schedule_reminder, configure_gmail_credentials, configure_mcp_server
 from ...tools.desktop.advanced.contacts import save_contact, get_contact_number, delete_contact
 from ...tools.desktop.shortcuts import perform_shortcut, control_brightness, control_display, manage_window
 from ...tools.web.search import web_search
@@ -87,7 +87,7 @@ def change_interaction_mode(mode: str) -> str:
 # Mapping of capability keys to the actual Python functions
 CAPABILITY_MAP = {
     "PERM_BROWSER": [
-        open_url, search_youtube, search_google, gmail_action, send_background_email,
+        open_url, search_youtube, search_google, gmail_action, send_background_email, read_background_email,
         playwright_navigate, playwright_click, playwright_type,
         playwright_screenshot, playwright_get_content, playwright_close,
         playwright_upload_file, google_meet_join, google_meet_leave,
@@ -118,7 +118,7 @@ def get_maya_tools() -> list:
         type_text, press_key, hotkey, click_mouse, 
         double_click_mouse, move_mouse_to, get_mouse_position,
         look_at_screen, manage_system_state, change_interaction_mode,
-        remember_fact, recall_facts, forget_fact, schedule_reminder, configure_gmail_credentials,
+        remember_fact, recall_facts, forget_fact, schedule_reminder, configure_gmail_credentials, configure_mcp_server,
         # App management is always available (no special permission needed)
         open_app, close_app, focus_app, list_open_apps, is_app_open,
         read_active_window_title,

@@ -77,6 +77,13 @@ Maya grows with you.
 * **Markdown-Based Skills:** Create custom skills instantly. Maya extends her own capabilities by reading `SKILL.md` files—no complex python boilerplate required!
 * **Hot-Reloading:** Drop a new plugin or skill into the folder, and Maya learns it instantly without needing a server restart.
 
+### 🔌 Universal MCP (Model Context Protocol) Support
+Infinite capabilities without writing custom integrations.
+* **Zero Custom Code:** Connect Maya to GitHub, SQLite, PostgreSQL, Slack, Google Drive, or Knowledge Graphs by simply adding a few lines to `mcp_servers.json`. No Python API integration needed!
+* **Auto-Discovery:** Maya automatically connects to your defined MCP servers (via `stdio` or `sse`), discovers available tools dynamically, and sanitizes schemas to be fully compatible with Gemini.
+* **Robust Concurrency:** Built with enterprise-grade asynchronous lifecycle management. Handles background task isolation, precise lock guards, and jittered exponential backoffs natively to prevent retry storms and deadlock scenarios.
+* **Auto MCP Configurator via Telegram:** No need to edit JSON files manually! Just tell Maya on Telegram: *"Add the YouTube MCP server using @modelcontextprotocol/server-youtube and this API key."* Maya validates the package using strict regex, sanitizes environment variables to prevent RCE/Shell Injection, and safely updates `mcp_servers.json` using atomic file writes (`os.replace`). *(e.g. get your YouTube API v3 Key from the [Google Cloud Console](https://console.cloud.google.com/apis/library/youtube.googleapis.com)).*
+
 ---
 
 ## ⚙️ Initial Setup
@@ -89,7 +96,7 @@ Maya grows with you.
    ```
 
 2. **API Keys Configuration**:
-   Create a `.env` file in the `backend/` directory and add your keys:
+   Create a `.env` file in the `backend/` directory and add your keys. *(Get your Gemini API Key for free from [Google AI Studio](https://aistudio.google.com/app/apikey))*
    ```env
    GEMINI_API_KEY=your_gemini_api_key_here
    ELEVENLABS_API_KEY=your_elevenlabs_key_here # Optional

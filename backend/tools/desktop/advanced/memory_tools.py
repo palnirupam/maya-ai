@@ -3,6 +3,9 @@ from ....database.models import UserPreferences, LongTermMemory
 from ....database.crypto import crypto_manager
 from ....brain.memory.long_term_memory import store_memory, retrieve_relevant_memories
 import json
+import os
+import re
+from pathlib import Path
 
 def remember_fact(topic: str, fact: str, importance: int = 3) -> str:
     """
@@ -122,3 +125,58 @@ def schedule_reminder(message: str, hours_from_now: float = 0, notify_channel: s
         return f"ERROR: Failed to schedule reminder. {e}"
     finally:
         db.close()
+
+
+def configure_mcp_server(server_name: str, npm_package: str, env_vars: dict = None) -> str:
+    """
+    Securely configures an MCP server for Maya by updating the mcp_servers.json configuration file.
+    Use this when the user asks to add or update an MCP server, API key, or integration (e.g., youtube, google drive).
+    """
+    # Security Validations
+    if not re.match(r"^[a-z0-9_-]+$", server_name):
+        return "ERROR: Invalid server_name. Must be lowercase alphanumeric with hyphens or underscores only."
+        
+    if not re.match(r"^(@[a-z0-9._-]+/)?(?!\.)[a-z0-9._-]+$", npm_package):
+        return "ERROR: Invalid npm_package. Unsafe characters detected."
+        
+    env_vars = env_vars or {}
+    for k, v in env_vars.items():
+        if not re.match(r"^[A-Z_][A-Z0-9_]*$", k):
+            return f"ERROR: Invalid environment variable key '{k}'."
+        # Check for harmful content in value
+        if any(bad in v for bad in ("\n", "\r", "%0a", "\x00", "$(", "`")):
+            return f"ERROR: Invalid character in environment variable value for '{k}'."
+
+    # Config Path
+    config_path = Path(__file__).parent.parent.parent.parent / "config" / "mcp_servers.json"
+    
+    # Read existing config
+    config = {"mcpServers": {}}
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception:
+            pass # fallback to default
+
+    if "mcpServers" not in config or not isinstance(config["mcpServers"], dict):
+        config["mcpServers"] = {}
+
+    # Hardcoded Templating (No raw JSON merging)
+    config["mcpServers"][server_name] = {
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", npm_package],
+        "env": env_vars
+    }
+    
+    # Atomic File Write
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = config_path.with_suffix(".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+        os.replace(tmp_path, config_path)
+        return f"SUCCESS: MCP Server '{server_name}' securely configured. Please restart Maya for changes to take effect."
+    except Exception as e:
+        return f"ERROR: Failed to save MCP configuration: {str(e)}"

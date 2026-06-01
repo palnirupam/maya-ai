@@ -12,6 +12,7 @@ import logging
 import json
 import inspect
 import httpx
+from ...tools.mcp_service import mcp_service
 
 logger = logging.getLogger(__name__)
 
@@ -475,7 +476,13 @@ class GeminiAdapter(LLMProvider):
                 part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
                 contents[-1].parts.append(part)
 
-            tools = override_tools if override_tools is not None else get_maya_tools()
+            if override_tools is not None:
+                tools = override_tools
+            else:
+                native_tools = get_maya_tools()
+                mcp_tools = await mcp_service.get_available_tools()
+                tools = native_tools + mcp_tools
+            
             config = types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.7,
@@ -566,7 +573,13 @@ class GeminiAdapter(LLMProvider):
                 part = types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
                 contents[-1].parts.append(part)
 
-            tools = override_tools if override_tools is not None else get_maya_tools()
+            if override_tools is not None:
+                tools = override_tools
+            else:
+                native_tools = get_maya_tools()
+                mcp_tools = await mcp_service.get_available_tools()
+                tools = native_tools + mcp_tools
+                
             config = types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.7,

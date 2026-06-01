@@ -57,6 +57,12 @@ def startup_event():
         start_md_skill_loader()
     except Exception as e:
         logging.error(f"Error starting MD Skill Loader: {e}")
+    try:
+        import asyncio
+        from backend.tools.mcp_service import mcp_service
+        asyncio.create_task(mcp_service.start())
+    except Exception as e:
+        logging.error(f"Error starting MCP Service: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -86,6 +92,11 @@ async def shutdown_event():
         stop_md_skill_loader()
     except Exception as e:
         logging.error(f"Error stopping MD Skill Loader: {e}")
+    try:
+        from backend.tools.mcp_service import mcp_service
+        await mcp_service.shutdown()
+    except Exception as e:
+        logging.error(f"Error stopping MCP Service: {e}")
 
 @app.get("/")
 def read_root():
