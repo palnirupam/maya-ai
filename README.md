@@ -45,10 +45,37 @@ Maya can natively interact with the web without manual mouse clicking.
 * 📚 **Google Classroom Automation:** Fetches pending assignments and programmatically uploads & submits files to Classroom.
 * 🎵 **Headless Ad-Free YouTube:** Play background music directly via VLC + yt-dlp without opening a browser or playing a single ad!
 
-### 🛡️ Enterprise-Grade Privacy Controls
-Spyware is creepy. Maya is transparent.
-* 🚫 **Sensitive App Auto-Blocker:** If you have Bitwarden, 1Password, or a Bank tab open, Maya physically **blocks the screenshot** to protect your passwords and OTPs.
-* 🔔 **Visual Overlay Feedback:** A Windows Toast Notification (`👁️ Maya is inspecting Chrome...`) pops up every single time she looks at your screen. You are always in control.
+### 🧠 Intelligent Multi-Agent System
+Maya operates on a sophisticated **4-Tier Routing Architecture**, ensuring maximum efficiency:
+* **Smart Routing:** Simple chats bypass agents for instant replies, while complex tasks are delegated to specialized agents (Coder, OS Executor, Researcher).
+* **Multi-Provider Fallback Chain:** Never goes offline! Automatically routes requests: `Gemini → OpenRouter → NVIDIA NIM → OpenAI`. If one rate-limits, the next one instantly takes over.
+* **Safety First:** Built-in capability gating (tools are disabled if not explicitly permitted), safety timeouts, and infinite-loop constraints.
+
+### 🛡️ Enterprise-Grade Security & Sandboxing
+Spyware is creepy. Maya is transparent and mathematically secure.
+* **Hardware-Bound AES-256 Encryption:** Your keys and passwords are encrypted using a cryptographic key derived natively from your Motherboard + CPU serial. They cannot be stolen and decrypted on another PC.
+* **AST-Based Skill Sandboxing:** Community plugins and skills are analyzed at the source level. Dangerous imports (`os`, `eval`, `exec`) are strictly blocked before execution.
+* **Cryptographic Integrity:** SHA-256 hash verification ensures loaded plugins haven't been maliciously tampered with.
+* **Sensitive App Auto-Blocker:** If you have Bitwarden, 1Password, or a Bank tab open, Maya physically **blocks the screenshot** to protect your passwords and OTPs.
+* **Visual Overlay Feedback:** A Windows Toast Notification (`👁️ Maya is inspecting Chrome...`) pops up every single time she looks at your screen. You are always in control.
+
+### 💾 3-Layer Encrypted Memory
+Maya actually remembers you. 
+* **Tri-Tier Storage:** Contextually divides memory into *Short-term Conversation*, *Emotional State*, and *Long-term Facts*.
+* **Importance-Based Expiry:** Irrelevant details fade away over time, while critical facts are retained forever.
+* **Secure Storage:** All memories are saved in a fully encrypted local SQLite database.
+
+### 🎭 Dynamic Contextual Personality
+Maya isn't just a bot, she has highly adaptable modes.
+* **4 Personality Modes:** Seamlessly switch between *Companion*, *Coding*, *Professional*, and *Friendly*.
+* **Religion-Neutral Enforcement:** Strictly enforces unbiased, respectful, and religion-neutral language in all interactions.
+* **Bengali Phonetic TTS:** Specialized linguistic rules mapped for flawless Bengali pronunciation during Text-to-Speech.
+* **Dynamic Prompt Assembly:** System prompts aren't static; they are built on-the-fly based on your current OS context and emotional memory.
+
+### 🧩 Hot-Reloadable Plugin & Skill System
+Maya grows with you.
+* **Markdown-Based Skills:** Create custom skills instantly. Maya extends her own capabilities by reading `SKILL.md` files—no complex python boilerplate required!
+* **Hot-Reloading:** Drop a new plugin or skill into the folder, and Maya learns it instantly without needing a server restart.
 
 ---
 
