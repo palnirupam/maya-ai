@@ -7,6 +7,7 @@ from ..database.connection import SessionLocal
 from ..database.models import ScheduledTask
 from ..database.crypto import crypto_manager
 from ..brain.memory.long_term_memory import cleanup_expired_memories
+from ..brain.memory.compaction import run_dreaming_mode
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +39,13 @@ class MayaScheduler:
             try:
                 now = datetime.now(timezone.utc)
                 
-                # Daily memory cleanup
+                # Daily memory cleanup and Dreaming Mode compaction
                 if not self.last_cleanup or (now - self.last_cleanup).days >= 1:
                     cleanup_expired_memories()
+                    try:
+                        await run_dreaming_mode(hours_threshold=12)
+                    except Exception as e:
+                        logger.error(f"Dreaming Mode failed: {e}")
                     self.last_cleanup = now
 
                 db = SessionLocal()

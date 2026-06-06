@@ -102,3 +102,4 @@ backend/voice/gpt_sovits_core/GPT_SoVITS/pretrained_models/
 
 # MCP Servers (Contains API Keys)
 backend/config/mcp_servers.json
+*.pid

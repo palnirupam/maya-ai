@@ -157,7 +157,19 @@ class GeminiLiveAdapter:
                         data["candidates"][0]["content"]["parts"][0]["inlineData"]
                     )
                     audio_b64: str = inline_data["data"]
-                    audio_bytes = base64.b64decode(audio_b64)
+                    raw_pcm_bytes = base64.b64decode(audio_b64)
+                    
+                    # Convert raw PCM16 24kHz to WAV
+                    import wave
+                    import io
+                    with io.BytesIO() as wav_io:
+                        with wave.open(wav_io, 'wb') as wav_file:
+                            wav_file.setnchannels(1)
+                            wav_file.setsampwidth(2) # 16-bit
+                            wav_file.setframerate(24000)
+                            wav_file.writeframes(raw_pcm_bytes)
+                        audio_bytes = wav_io.getvalue()
+
                 except (KeyError, IndexError, ValueError) as e:
                     logger.error(f"[GeminiTTS] Failed to extract audio from response: {e}")
                     logger.debug(f"[GeminiTTS] Response keys: {list(data.keys())}")

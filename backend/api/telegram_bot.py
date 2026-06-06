@@ -31,7 +31,8 @@ import io
 import json
 import logging
 import os
-import random
+import os
+import secrets
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -43,6 +44,8 @@ from backend.brain.orchestrator import orchestrator
 from backend.database.connection import SessionLocal
 from backend.database.crypto import crypto_manager
 from backend.database.models import UserPreferences
+from backend.brain.reasoning.tool_planner import tool_planner
+from backend.system.process_manager import process_manager
 from backend.vision.capture.screen_capture import screen_capture
 
 logger = logging.getLogger(__name__)
@@ -174,7 +177,8 @@ class TelegramBotManager:
 
             code = _get("TELEGRAM_PAIRING_CODE")
             if not code:
-                code = str(random.randint(100_000, 999_999))
+                # Use secrets for secure pairing code
+                code = str(secrets.randbelow(900000) + 100000)
                 _set("TELEGRAM_PAIRING_CODE", code)
             self.pairing_code = code
 
@@ -337,6 +341,16 @@ class TelegramBotManager:
             await self._send_wa_link_guide(chat_id)
             return
 
+        # ── Microphone Lock / Sleep Mode ───────────────────────────────────
+        if text_lower in {"/lock", "🔒 mic lock", "lock mic", "sleep mode on",
+                          "mic lock koro", "lock koro", "ঘুমাও", "lock"}:
+            await self._lock_microphone(chat_id)
+            return
+        if text_lower in {"/unlock", "🔓 mic unlock", "unlock mic", "sleep mode off",
+                          "mic unlock koro", "unlock koro", "জাগো", "unlock"}:
+            await self._unlock_microphone(chat_id)
+            return
+
         # ── Dangerous command detection ────────────────────────────────────
         if self._is_dangerous_shutdown(text_lower):
             await self._ask_shutdown_confirm(chat_id, text)
@@ -387,6 +401,26 @@ class TelegramBotManager:
             await self._cb_confirm_shutdown(chat_id)
         elif data == "cancel_shutdown":
             await self._cb_cancel_shutdown(chat_id)
+            
+        # ── Exec Approval Queue ────────────────────────────────────────────
+        elif data.startswith("exec_approve_"):
+            req_id = data[len("exec_approve_"):]
+            user_id = str(cq["from"].get("username", cq["from"].get("id", "telegram_user")))
+            tool_planner.resolve_tool(req_id, approved=True, user_id=user_id)
+            await self._edit_message(
+                chat_id, str(cq["message"]["message_id"]),
+                "✅ *Command Approved.* Executing...",
+                parse_mode="Markdown"
+            )
+        elif data.startswith("exec_deny_"):
+            req_id = data[len("exec_deny_"):]
+            user_id = str(cq["from"].get("username", cq["from"].get("id", "telegram_user")))
+            tool_planner.resolve_tool(req_id, approved=False, user_id=user_id)
+            await self._edit_message(
+                chat_id, str(cq["message"]["message_id"]),
+                "❌ *Command Denied.* Execution aborted.",
+                parse_mode="Markdown"
+            )
 
     # ──────────────────────────────────────────────────────────────────────────
     # Streaming reply
@@ -430,6 +464,23 @@ class TelegramBotManager:
                     session_id, text
                 ):
                     if isinstance(chunk, dict):
+                        if chunk.get("type") == "tool_call_request":
+                            data = chunk.get("data", {})
+                            req_id = data.get("request_id")
+                            tool_name = data.get("tool_name", "unknown")
+                            args = data.get("args", {})
+                            
+                            markup = {
+                                "inline_keyboard": [[
+                                    {"text": "✅ Approve", "callback_data": f"exec_approve_{req_id}"},
+                                    {"text": "❌ Deny", "callback_data": f"exec_deny_{req_id}"},
+                                ]]
+                            }
+                            await self._send_message(
+                                chat_id,
+                                f"⚠️ *Maya Exec Approval*\n\nMaya wants to run: `{tool_name}`\nArguments:\n```json\n{json.dumps(args, indent=2)}\n```\n\nDo you approve?",
+                                reply_markup=markup
+                            )
                         continue
                     full_response += chunk
                     await _flush()
@@ -1023,12 +1074,16 @@ class TelegramBotManager:
         try:
             from backend.tools.desktop.advanced.system_tools import get_system_stats
             import pygetwindow as gw
+            from backend.api.main import get_active_listener
             stats  = get_system_stats()
             active = gw.getActiveWindow()
             title  = active.title if active else "None"
+            listener = get_active_listener()
+            mic_status = "🔒 Locked (Sleep Mode)" if (listener and listener.is_locked) else "🎙️ Active (Listening)"
             msg    = (
                 "📊 *System Status:*\n\n"
                 f"🖥️ *Active Window:* `{title}`\n"
+                f"🎙️ *Microphone:* {mic_status}\n"
                 f"🔋 *Resources:* {stats}"
             )
         except Exception as exc:
@@ -1055,20 +1110,95 @@ class TelegramBotManager:
             )
 
     async def _emergency_stop(self, chat_id: str) -> None:
+        # 1. Cancel the specific active task in the telegram bot stream
         task = self._active_tasks.get(chat_id)
         if task and not task.done():
             task.cancel()
             self._active_tasks.pop(chat_id, None)
+            
+        # 2. Trigger the Deep Emergency Stop for all OS processes and background tasks
+        await self._send_message(chat_id, "🛑 *Emergency Stop Triggered!* Canceling tasks and forcefully terminating process trees...")
+        
+        try:
+            stats = await process_manager.emergency_stop()
+            tasks_canceled = stats.get("tasks_canceled", 0)
+            pids_killed = stats.get("pids_killed", 0)
+            
             await self._send_message(
                 chat_id,
-                "🛑 *Emergency Stop!* সব active operation বন্ধ হয়েছে।",
+                f"✅ *System Halted.*\n- Tasks canceled: {tasks_canceled}\n- Processes force-killed: {pids_killed}",
                 reply_markup=self._default_keyboard(),
             )
-        else:
+        except Exception as e:
+            logger.error(f"Error during deep emergency stop: {e}")
+            await self._send_message(chat_id, "⚠️ Error during deep emergency stop.")
+
+    async def _lock_microphone(self, chat_id: str) -> None:
+        """Put Maya's desktop microphone into Sleep Mode."""
+        try:
+            from backend.api.main import get_active_listener
+            listener = get_active_listener()
+            if listener is None:
+                await self._send_message(
+                    chat_id,
+                    "⚠️ *Voice engine চালু নেই।* Maya restart করো প্রথমে।",
+                    reply_markup=self._default_keyboard(),
+                )
+                return
+            if listener.is_locked:
+                await self._send_message(
+                    chat_id,
+                    "🔒 *Microphone ইতিমধ্যে Locked আছে!*\n\nUnlock করতে `/unlock` পাঠাও।",
+                    reply_markup=self._default_keyboard(),
+                )
+                return
+            listener.lock()
             await self._send_message(
-                chat_id, "⚠️ *কোনো active operation নেই।*",
+                chat_id,
+                "🔒 *Microphone Locked!*\n\n"
+                "Maya এখন ঘুমিয়ে পড়েছে। 😴\n"
+                "তোমার ঘরে কেউ কথা বললেও সে শুনবে না।\n\n"
+                "ফিরে এলে `/unlock` দিয়ে জাগিয়ে দাও।",
                 reply_markup=self._default_keyboard(),
             )
+            logger.info("[TelegramBot] Microphone locked via Telegram by chat_id=%s", chat_id)
+        except Exception as exc:
+            logger.error("Lock microphone error: %s", exc, exc_info=True)
+            await self._send_message(chat_id, f"❌ Lock error: {exc}",
+                                     reply_markup=self._default_keyboard())
+
+    async def _unlock_microphone(self, chat_id: str) -> None:
+        """Wake Maya's desktop microphone from Sleep Mode."""
+        try:
+            from backend.api.main import get_active_listener
+            listener = get_active_listener()
+            if listener is None:
+                await self._send_message(
+                    chat_id,
+                    "⚠️ *Voice engine চালু নেই।* Maya restart করো প্রথমে।",
+                    reply_markup=self._default_keyboard(),
+                )
+                return
+            if not listener.is_locked:
+                await self._send_message(
+                    chat_id,
+                    "🔓 *Microphone ইতিমধ্যে Unlocked আছে!*\n\nMaya সক্রিয়ভাবে শুনছে।",
+                    reply_markup=self._default_keyboard(),
+                )
+                return
+            listener.unlock()
+            await self._send_message(
+                chat_id,
+                "🔓 *Microphone Unlocked!*\n\n"
+                "Maya এখন জেগে উঠেছে! 👋\n"
+                "ল্যাপটপের সামনে কথা বললেই সে শুনবে।",
+                reply_markup=self._default_keyboard(),
+            )
+            logger.info("[TelegramBot] Microphone unlocked via Telegram by chat_id=%s", chat_id)
+        except Exception as exc:
+            logger.error("Unlock microphone error: %s", exc, exc_info=True)
+            await self._send_message(chat_id, f"❌ Unlock error: {exc}",
+                                     reply_markup=self._default_keyboard())
 
     # ──────────────────────────────────────────────────────────────────────────
     # Background loops

@@ -1,7 +1,14 @@
 import uuid
 import logging
 import asyncio
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
+
+from backend.database.connection import SessionLocal
+from backend.database.models import PendingApproval
+from backend.security.risk_classifier import risk_classifier
+from backend.security.audit_logger import audit_logger
 
 logger = logging.getLogger(__name__)
 
@@ -10,51 +17,125 @@ class ToolPlanner:
     Intercepts LLM tool calls and queues them for user approval.
     """
     def __init__(self):
-        # Maps request_id -> Pending Tool Call Details
-        self.approval_queue: Dict[str, Any] = {}
+        # Maps request_id -> Future
+        # We only keep the futures in memory. The actual data lives in the DB.
+        self._memory_futures: Dict[str, dict] = {}
 
     def queue_tool(self, tool_name: str, payload: dict, risk_level: str = "safe") -> dict:
         """
-        Creates a pending tool request and returns a payload to be sent via WebSocket
-        to the frontend ToolApprovalCard.
+        Creates a pending tool request in SQLite and returns a payload to be sent via WebSocket
+        or Telegram.
         """
         request_id = str(uuid.uuid4())
+        actual_risk = risk_classifier.classify(tool_name, payload)
         
+        # Override if explicitly marked higher
+        if risk_level == "danger" and actual_risk in ["LOW"]:
+            actual_risk = "MEDIUM"
+
         request_data = {
             "request_id": request_id,
             "tool_name": tool_name,
             "payload": payload,
-            "risk_level": risk_level,
+            "risk_level": actual_risk,
             "status": "pending",
-            "future": asyncio.Future()
         }
         
-        self.approval_queue[request_id] = request_data
-        logger.info(f"Tool {tool_name} queued for approval. ID: {request_id}")
+        # 1. Save to SQLite
+        try:
+            db = SessionLocal()
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+            db_req = PendingApproval(
+                request_id=request_id,
+                tool_name=tool_name,
+                payload=payload,
+                risk_level=actual_risk,
+                status="pending",
+                expires_at=expires_at
+            )
+            db.add(db_req)
+            db.commit()
+        except Exception as e:
+            logger.error(f"Failed to save PendingApproval to DB: {e}")
+        finally:
+            db.close()
+
+        # 2. Store Future in memory
+        self._memory_futures[request_id] = {
+            "future": asyncio.Future(),
+            "created_at_ts": time.monotonic()
+        }
         
-        # Return a safe copy without the future
-        return {k: v for k, v in request_data.items() if k != "future"}
+        logger.info(f"Tool {tool_name} queued for approval (Risk: {actual_risk}). ID: {request_id}")
+        return request_data
 
     async def wait_for_approval(self, request_id: str) -> bool:
-        """Blocks until resolve_tool is called by the frontend websocket handler."""
-        if request_id not in self.approval_queue:
+        """Blocks until resolve_tool is called."""
+        if request_id not in self._memory_futures:
+            # Check DB to see if it was resolved in another process or before restart
+            try:
+                db = SessionLocal()
+                req = db.query(PendingApproval).filter_by(request_id=request_id).first()
+                if req and req.status == "approved":
+                    return True
+                elif req and req.status == "denied":
+                    return False
+            finally:
+                db.close()
             return False
+            
+        future_data = self._memory_futures[request_id]
         
         try:
-            # Wait up to 60 seconds for user to click
-            return await asyncio.wait_for(self.approval_queue[request_id]["future"], timeout=60.0)
+            # Wait up to 60 seconds for user to click (could be higher now that we have DB)
+            return await asyncio.wait_for(future_data["future"], timeout=120.0)
         except asyncio.TimeoutError:
             logger.warning(f"Tool request {request_id} timed out waiting for user approval.")
             return False
+        finally:
+            self._memory_futures.pop(request_id, None)
 
-    def resolve_tool(self, request_id: str, approved: bool) -> Any:
-        """Called when the frontend sends back an [Approve] or [Deny] event."""
-        if request_id not in self.approval_queue:
-            return {"status": "error", "message": "Request ID not found or expired."}
-            
-        request = self.approval_queue.pop(request_id)
-        if not request["future"].done():
-            request["future"].set_result(approved)
+    def resolve_tool(self, request_id: str, approved: bool, user_id: str = "telegram_user") -> Any:
+        """Called when the user sends back an [Approve] or [Deny] event."""
+        
+        status_str = "approved" if approved else "denied"
+        tool_name = "unknown"
+        payload = {}
+        risk_level = "unknown"
+        
+        # 1. Update DB
+        try:
+            db = SessionLocal()
+            req = db.query(PendingApproval).filter_by(request_id=request_id).first()
+            if req:
+                req.status = status_str
+                tool_name = req.tool_name
+                payload = req.payload
+                risk_level = req.risk_level
+                db.commit()
+        except Exception as e:
+            logger.error(f"Failed to update PendingApproval in DB: {e}")
+        finally:
+            db.close()
+
+        # 2. Resolve memory future
+        latency_ms = 0
+        if request_id in self._memory_futures:
+            future_data = self._memory_futures[request_id]
+            latency_ms = int((time.monotonic() - future_data["created_at_ts"]) * 1000)
+            if not future_data["future"].done():
+                future_data["future"].set_result(approved)
+
+        # 3. Write to Audit Log (JSONL)
+        audit_logger.log_approval(
+            request_id=request_id,
+            tool_name=tool_name,
+            payload=payload,
+            risk_level=risk_level,
+            approved=approved,
+            approved_by=user_id,
+            latency_ms=latency_ms
+        )
             
         if not approved:
             return {"status": "denied", "message": "User denied the operation."}

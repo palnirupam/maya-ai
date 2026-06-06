@@ -166,11 +166,17 @@ class Transcriber:
 
         # ── Step 1: Convert WebM → WAV (browser sends WebM/Opus) ────────────
         if isinstance(audio_data, str):
-            logger.info(f"[Transcriber] Converting audio file: {audio_data}")
-            wav_path = await asyncio.to_thread(self._convert_webm_to_wav, audio_data)
-            if not wav_path:
-                logger.error("[Transcriber] Audio conversion failed.")
-                return ""
+            if audio_data.endswith(".webm"):
+                logger.info(f"[Transcriber] Converting audio file: {audio_data}")
+                wav_path = await asyncio.to_thread(self._convert_webm_to_wav, audio_data)
+                if not wav_path:
+                    logger.error("[Transcriber] Audio conversion failed.")
+                    return ""
+                wav_path_to_cleanup = wav_path
+            else:
+                # Already a wav file (from native desktop listener)
+                wav_path = audio_data
+                wav_path_to_cleanup = wav_path
 
             # Silence check — warn if mic is muted/quiet
             try:
@@ -189,7 +195,6 @@ class Transcriber:
                 logger.debug(f"[Transcriber] Amplitude check failed: {e}")
 
             audio_data = wav_path
-            wav_path_to_cleanup = wav_path
 
         # ── Step 2: Try Gemini STT first (primary engine) ───────────────────
         if isinstance(audio_data, str):  # only for file paths (wav)

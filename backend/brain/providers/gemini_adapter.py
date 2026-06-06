@@ -13,6 +13,7 @@ import json
 import inspect
 import httpx
 from ...tools.mcp_service import mcp_service
+from .fallback import fallback_manager
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +243,7 @@ class GeminiAdapter(LLMProvider):
             else:
                 self.api_provider = "gemini"
                 self.api_url = None
-                self.model_name = stored_model if stored_model else "gemini-2.5-flash"
+                self.model_name = stored_model if stored_model else "gemini-3.5-flash"
                 self.client = genai.Client(api_key=api_key)
                 logger.info("Universal Adapter: Configured for native Google Gemini API.")
         finally:
@@ -274,7 +275,9 @@ class GeminiAdapter(LLMProvider):
                     models_to_try.append(m)
                         
         last_error = None
-        for model in models_to_try:
+        available_models = fallback_manager.get_available_models(models_to_try)
+        
+        for model in available_models:
             payload = {
                 "model": model,
                 "messages": messages,
@@ -288,8 +291,8 @@ class GeminiAdapter(LLMProvider):
                     response = await client.post(self.api_url, headers=headers, json=payload, timeout=30.0)
                     response.raise_for_status()
                     if model != self.model_name:
-                        logger.info(f"Dynamically switching active model to {model} due to fallback success.")
-                        self.model_name = model
+                        logger.info(f"Using fallback model {model} for this request due to success.")
+                    fallback_manager.mark_success(model)
                     data = response.json()
                     choice = data["choices"][0]
                     message = choice.get("message", {})
@@ -305,6 +308,7 @@ class GeminiAdapter(LLMProvider):
                     return message.get("content", "") or "Done."
             except Exception as e:
                 logger.warning(f"Custom LLM API failed with model {model}: {e}")
+                fallback_manager.mark_failed(model, str(e))
                 last_error = e
                 
         if last_error:
@@ -341,7 +345,9 @@ class GeminiAdapter(LLMProvider):
                         
         stream_started = False
         last_error = None
-        for model in models_to_try:
+        available_models = fallback_manager.get_available_models(models_to_try)
+        
+        for model in available_models:
             payload = {
                 "model": model,
                 "messages": messages,
@@ -358,8 +364,8 @@ class GeminiAdapter(LLMProvider):
                     async with client.stream("POST", self.api_url, headers=headers, json=payload, timeout=30.0) as response:
                         response.raise_for_status()
                         if model != self.model_name:
-                            logger.info(f"Dynamically switching active model to {model} due to fallback success.")
-                            self.model_name = model
+                            logger.info(f"Using fallback model {model} for this stream due to success.")
+                        fallback_manager.mark_success(model)
                         async for line in response.aiter_lines():
                             if line.startswith("data: "):
                                 data_str = line[6:].strip()
@@ -417,6 +423,8 @@ class GeminiAdapter(LLMProvider):
                 break
             except Exception as e:
                 logger.warning(f"Custom LLM Stream failed with model {model} (started={stream_started}): {e}")
+                if not stream_started:
+                    fallback_manager.mark_failed(model, str(e))
                 last_error = e
                 if stream_started:
                     break
@@ -491,7 +499,7 @@ class GeminiAdapter(LLMProvider):
                     disable=True
                 )
             )
-            models_to_try = [
+            fallbacks = [
                 'gemini-3.1-flash-lite',
                 'gemini-2.5-flash-lite',
                 'gemini-2.5-flash',
@@ -500,18 +508,26 @@ class GeminiAdapter(LLMProvider):
                 'gemini-3.5-flash',
                 'gemini-3.1-pro-preview'
             ]
+            models_to_try = [self.model_name]
+            for m in fallbacks:
+                if m not in models_to_try:
+                    models_to_try.append(m)
             response = None
             last_error = None
-            for model in models_to_try:
+            available_models = fallback_manager.get_available_models(models_to_try)
+            
+            for model in available_models:
                 try:
                     response = await self.client.aio.models.generate_content(
                         model=model,
                         contents=contents,
                         config=config
                     )
+                    fallback_manager.mark_success(model)
                     break
                 except Exception as e:
                     logger.warning(f"Failed generate_content with model {model} ({e}). Trying fallback...")
+                    fallback_manager.mark_failed(model, str(e))
                     last_error = e
             
             if response is None:
@@ -589,7 +605,7 @@ class GeminiAdapter(LLMProvider):
                 )
             )
 
-            models_to_try = [
+            fallbacks = [
                 'gemini-3.1-flash-lite',
                 'gemini-2.5-flash-lite',
                 'gemini-2.5-flash',
@@ -598,18 +614,24 @@ class GeminiAdapter(LLMProvider):
                 'gemini-3.5-flash',
                 'gemini-3.1-pro-preview'
             ]
-            
+            models_to_try = [self.model_name]
+            for m in fallbacks:
+                if m not in models_to_try:
+                    models_to_try.append(m)
             stream_started = False
             last_error = None
             current_contents = contents  # May be cleaned per-attempt
             
-            for model in models_to_try:
+            available_models = fallback_manager.get_available_models(models_to_try)
+            
+            for model in available_models:
                 try:
                     generator = await self.client.aio.models.generate_content_stream(
                         model=model,
                         contents=current_contents,
                         config=config
                     )
+                    fallback_manager.mark_success(model)
                     async for chunk in generator:
                         stream_started = True
                         if chunk.text:
@@ -640,6 +662,8 @@ class GeminiAdapter(LLMProvider):
                 except Exception as e:
                     err_str = str(e)
                     logger.warning(f"Failed generate_content_stream with model {model} (started={stream_started}): {e}")
+                    if not stream_started:
+                        fallback_manager.mark_failed(model, err_str)
                     last_error = e
                     if stream_started:
                         break

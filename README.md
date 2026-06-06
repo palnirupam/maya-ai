@@ -65,6 +65,13 @@ Maya actually remembers you.
 * **Importance-Based Expiry:** Irrelevant details fade away over time, while critical facts are retained forever.
 * **Secure Storage:** All memories are saved in a fully encrypted local SQLite database.
 
+### ⚙️ Advanced Platform Architecture
+Maya has been heavily upgraded to perform as a highly resilient and fault-tolerant agent platform.
+* 🛡️ **Generic Exec Approval & Audit:** Dangerous OS commands are intercepted and sent to an SQLite queue for human approval. Every single tool action is logged with precision in an `audit.jsonl` file.
+* 🛑 **Deep Emergency Stop:** Running a runaway script or infinite loop? Tapping "Emergency Stop" on Telegram doesn't just cancel async tasks; it physically hunts down and kills (`taskkill /F /T`) every child process spawned by the agent to prevent memory leaks.
+* 🔄 **Multi-Provider Auto Fallback:** If your default model (e.g. Gemini 3.5 Flash) hits a `429 Rate Limit` or `503 Error`, a Smart Cooldown Manager instantly places the provider on a 10-minute timeout and seamlessly shifts requests to fallback models (e.g. Flash-Lite) to guarantee zero downtime.
+* 😴 **Dreaming Mode (Memory Compaction):** Every night, a background scheduler wakes up to review your conversations from the past 12 hours. It extracts your core *Preferences, Contacts, and Ongoing Tasks*, encrypts them into Long-Term Memory, and permanently archives the raw logs to save DB space and context window costs.
+
 ### 🎭 Dynamic Contextual Personality
 Maya isn't just a bot, she has highly adaptable modes.
 * **4 Personality Modes:** Seamlessly switch between *Companion*, *Coding*, *Professional*, and *Friendly*.

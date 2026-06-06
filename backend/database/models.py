@@ -71,3 +71,17 @@ class ScheduledTask(Base):
     # gui_popup = WebSocket toast to frontend; chat_message = Maya speaks it
     notify_channel = Column(String, default="chat_message")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class PendingApproval(Base):
+    """Stores tool calls waiting for human approval."""
+    __tablename__ = "pending_approvals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    request_id = Column(String, unique=True, index=True, nullable=False)
+    tool_name = Column(String, nullable=False)
+    payload = Column(JSON, nullable=False)
+    risk_level = Column(String, default="LOW")
+    status = Column(String, default="pending")  # pending, approved, denied, expired
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+
