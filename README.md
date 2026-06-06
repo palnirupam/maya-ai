@@ -75,7 +75,8 @@ Maya actually remembers you.
 Maya has been heavily upgraded to perform as a highly resilient and fault-tolerant agent platform.
 * 🛡️ **Generic Exec Approval & Audit:** Dangerous OS commands are intercepted and sent to an SQLite queue for human approval. Every single tool action is logged with precision in an `audit.jsonl` file.
 * 🛑 **Deep Emergency Stop:** Running a runaway script or infinite loop? Tapping "Emergency Stop" on Telegram doesn't just cancel async tasks; it physically hunts down and kills (`taskkill /F /T`) every child process spawned by the agent to prevent memory leaks.
-* 🔄 **Multi-Provider Auto Fallback:** If your default model (e.g. Gemini 3.5 Flash) hits a `429 Rate Limit` or `503 Error`, a Smart Cooldown Manager instantly places the provider on a 10-minute timeout and seamlessly shifts requests to fallback models (e.g. Flash-Lite) to guarantee zero downtime.
+* 🔄 **Multi-Provider Auto Fallback & Probing:** If the primary model hits a `429 Rate Limit` or `503 Error`, it shifts to fallback models and starts an active probing loop with exponential backoff (`30s → 60s → 120s → 300s`) to dynamically restore the primary model early upon recovery.
+* 🪝 **Secure Event-Driven Hooks System:** Run custom local scripts on events (like `on_session_start`, `on_sensitive_app_detected`, `on_command_approval_request`). Enforces strict absolute path checks within `hooks/`, execution timeouts, and a concurrency limit of 10 (`asyncio.Semaphore(10)`) to protect against process storms and command injections.
 * 😴 **Dreaming Mode (Memory Compaction):** Every night, a background scheduler wakes up to review your conversations from the past 12 hours. It extracts your core *Preferences, Contacts, and Ongoing Tasks*, encrypts them into Long-Term Memory, and permanently archives the raw logs to save DB space and context window costs.
 
 ### 🎭 Dynamic Contextual Personality
