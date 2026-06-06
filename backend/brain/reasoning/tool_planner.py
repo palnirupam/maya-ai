@@ -72,7 +72,8 @@ class ToolPlanner:
     async def wait_for_approval(self, request_id: str) -> bool:
         """Blocks until resolve_tool is called."""
         if request_id not in self._memory_futures:
-            # Check DB to see if it was resolved in another process or before restart
+            # This request_id is unknown to memory (e.g., server restarted mid-approval).
+            # Check DB for the EXACT request_id to see if it was already resolved.
             try:
                 db = SessionLocal()
                 req = db.query(PendingApproval).filter_by(request_id=request_id).first()
@@ -80,17 +81,19 @@ class ToolPlanner:
                     return True
                 elif req and req.status == "denied":
                     return False
+                # Status is still "pending" or not found → unknown request, deny for safety
+                logger.warning(f"[ToolPlanner] request_id {request_id} not in memory and not resolved in DB. Denying for safety.")
+                return False
             finally:
                 db.close()
-            return False
             
         future_data = self._memory_futures[request_id]
         
         try:
-            # Wait up to 60 seconds for user to click (could be higher now that we have DB)
-            return await asyncio.wait_for(future_data["future"], timeout=120.0)
+            # Wait up to 5 minutes for user to click Approve/Deny
+            return await asyncio.wait_for(future_data["future"], timeout=300.0)
         except asyncio.TimeoutError:
-            logger.warning(f"Tool request {request_id} timed out waiting for user approval.")
+            logger.warning(f"Tool request {request_id} timed out waiting for user approval. Auto-denying.")
             return False
         finally:
             self._memory_futures.pop(request_id, None)

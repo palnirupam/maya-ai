@@ -12,11 +12,12 @@ Maya is not just a chatbot—she is a **Context-Aware Desktop Agent** designed t
 
 ## 🌟 Key Features
 
-### 🗣️ Immersive Voice Engine (GPT-SoVITS)
-Maya doesn't sound like a robot. She is powered by a localized **GPT-SoVITS Engine**, allowing for ultra-realistic voice cloning with dynamic emotion control.
+### 🗣️ Hybrid Voice Engine (Gemini Native Audio & Fallbacks)
+Maya speaks naturally using state-of-the-art TTS models with smooth transition logic:
+* 🔊 **Gemini Native Audio (Default):** Uses `gemini-2.5-flash-preview-tts` out-of-the-box to generate ultra-realistic, expressive human-like speech.
 * 🎙️ **VAD Pipeline:** Uses Silero VAD + Faster Whisper to transcribe your voice perfectly.
-* 🎭 **Emotion Control:** She dynamically changes her voice tone (Happy, Sad, Angry, Cute, Romantic) based on context.
-* 🔄 **Smart Fallback:** If local TTS is busy, she seamlessly falls back to Microsoft Edge Neural TTS.
+* 🔄 **Built-in Fallback:** Automatically falls back to Microsoft Edge Neural TTS if the primary engine encounters network lag or rate limits.
+* 🎭 **Voice Cloning Support:** Ready-to-use adapters for local offline **GPT-SoVITS** (requires running a local server on port 9880) and cloud **ElevenLabs / cvoice.ai** for custom voice prints.
 
 ### 📱 Remote Mobile Control (Telegram & WhatsApp)
 Maya bridges the gap between your desktop and mobile phone with native integrations.
@@ -26,7 +27,7 @@ Maya bridges the gap between your desktop and mobile phone with native integrati
 * 💬 **WhatsApp Integration:** 
   * 📨 **Background Message Reading & Sending:** Maya natively reads recent WhatsApp chats and summarizes them via the background service. You can ask *"Did Pintu send any new messages?"* straight from Telegram without opening your PC.
   * 🔒 **Zero-Config Auto-Auth Security:** Features an enterprise-grade dynamic token injection. A cryptographically secure 64-character key (`secrets.token_hex`) is generated in memory, securely shared via atomic Temp files (`icacls` restricted), and injected directly into the Node.js subprocess. No `.env` manual setups required—100% robust and hack-proof out of the box!
-* 📬 **Headless Background Emailer:** Send secure emails completely in the background via SMTP (Gmail) using AES-GCM encrypted credentials. Fully supports **file attachments** (send any PDF, image, or document from your PC remotely).
+* 📬 **Headless Background Emailer:** Send secure emails completely in the background via SMTP (Gmail) using AES encrypted credentials. Fully supports **file attachments** (send any PDF, image, or document from your PC remotely).
 * 🔍 **Recursive PC File Search:** Locates any file on your hard drives in seconds. Highly optimized to skip heavy system/dependency folders (like `AppData`, `node_modules`, `.git`) for fast, crash-free indexing.
 * ⚡ **Lightning Fast Routing:** Optimized Gemini API adapters auto-route between `gemini-3.5-flash` and `gemini-2.5-flash` for sub-3-second mobile replies.
 
@@ -41,7 +42,7 @@ Maya can see your screen, but **only when you ask her to**.
 ### 🌐 Advanced Browser & Web Automation
 Maya can natively interact with the web without manual mouse clicking.
 * 🎭 **Playwright Integration:** Native `async` Playwright engine allows Maya to navigate, click, type, and extract structured data from any website programmatically.
-* 🎥 **Google Meet Automation:** Automatically joins Meet calls, manages mic/camera state, and handles attendance.
+* 🎥 **Google Meet Automation:** Automatically joins Meet calls, grants browser permissions, and configures mic/camera states before joining.
 * 📚 **Google Classroom Automation:** Fetches pending assignments and programmatically uploads & submits files to Classroom.
 * 🎵 **Headless Ad-Free YouTube:** Play background music directly via VLC + yt-dlp without opening a browser or playing a single ad!
 
@@ -53,17 +54,22 @@ Maya operates on a sophisticated **4-Tier Routing Architecture**, ensuring maxim
 
 ### 🛡️ Enterprise-Grade Security & Sandboxing
 Spyware is creepy. Maya is transparent and mathematically secure.
-* **Hardware-Bound AES-256 Encryption:** Your keys and passwords are encrypted using a cryptographic key derived natively from your Motherboard + CPU serial. They cannot be stolen and decrypted on another PC.
+* **Hardware-Bound AES Encryption:** Your keys and passwords are encrypted using a cryptographic key derived natively from your Motherboard + CPU serial. They cannot be stolen and decrypted on another PC.
 * **AST-Based Skill Sandboxing:** Community plugins and skills are analyzed at the source level. Dangerous imports (`os`, `eval`, `exec`) are strictly blocked before execution.
 * **Cryptographic Integrity:** SHA-256 hash verification ensures loaded plugins haven't been maliciously tampered with.
 * **Sensitive App Auto-Blocker:** If you have Bitwarden, 1Password, or a Bank tab open, Maya physically **blocks the screenshot** to protect your passwords and OTPs.
 * **Visual Overlay Feedback:** A Windows Toast Notification (`👁️ Maya is inspecting Chrome...`) pops up every single time she looks at your screen. You are always in control.
 
-### 💾 3-Layer Encrypted Memory
+### 💾 3-Layer Encrypted Vector Memory (Semantic Search)
 Maya actually remembers you. 
 * **Tri-Tier Storage:** Contextually divides memory into *Short-term Conversation*, *Emotional State*, and *Long-term Facts*.
 * **Importance-Based Expiry:** Irrelevant details fade away over time, while critical facts are retained forever.
-* **Secure Storage:** All memories are saved in a fully encrypted local SQLite database.
+* **Semantic Vector Search**: Uses Google's state-of-the-art `gemini-embedding-2` model (3072-dimensional vectors) and `numpy` to run local semantic similarity queries, replacing slow keyword-based decryption scans.
+* **Weighted Scoring & Gated Retrieval**: Combines semantic similarity with memory importance using a gating threshold ($similarity \ge 0.30$ or $importance == 5$) and a configurable score threshold ($score \ge 0.45$, where $score = similarity + importance \times 0.05$). This keeps context relevant and compact.
+* **Dynamic Safe Backfilling**: Automatically embeds legacy memories on-the-fly (capped at `5` per query to prevent latency spikes) and persists them in the SQLite database in single-batch commits.
+* **Retrieval Analytics**: Automatically tracks retrieval stats (`retrieval_count` and `last_accessed` time) for candidate ranking.
+* **Security-Fuzzed Database**: Evaluated against threat models including SQL Injection, null-byte input, non-finite vector parameters (NaN/Infinity), corrupted vector JSON, and Unicode/XSS script tag injections to guarantee zero backend crashes.
+* **Secure Storage**: Raw memory content continues to be encrypted in local SQLite using hardware-bound keys (Motherboard + CPU ID), keeping vectors anonymous and secure.
 
 ### ⚙️ Advanced Platform Architecture
 Maya has been heavily upgraded to perform as a highly resilient and fault-tolerant agent platform.
@@ -139,9 +145,9 @@ npm start
 ### Backend (Python + FastAPI)
 * **LLM Engine:** Gemini 2.5/3.5 Flash via `google-genai`
 * **Multi-Agent Orchestrator:** Stateful task delegation across specialized sub-agents (Researcher, Coder, OS Executor) with safety timeouts and loop constraints
-* **Voice:** Faster-Whisper, Silero VAD, GPT-SoVITS, Edge-TTS
+* **Voice:** Gemini Native Audio (default), Edge-TTS, Faster-Whisper, Silero VAD, GPT-SoVITS, ElevenLabs
 * **Vision & Automation:** PyAutoGUI, mss, PyGetWindow, EasyOCR, RapidFuzz
-* **Security:** AES-GCM Encrypted Settings, Sensitive App Keyword Blocking
+* **Security:** AES Encrypted Settings, Sensitive App Keyword Blocking
 
 ### Frontend (React + Vite)
 * **State Management:** Zustand

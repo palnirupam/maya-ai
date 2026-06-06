@@ -33,6 +33,11 @@ class RiskClassifier:
 
     def classify(self, tool_name: str, payload: dict) -> str:
         """Returns LOW, MEDIUM, HIGH, or CRITICAL."""
+        if tool_name == "permanent_delete_email":
+            return "CRITICAL"
+        if tool_name == "trash_background_email":
+            return "HIGH"
+            
         if tool_name not in ["execute_powershell", "execute_python", "run_terminal_command"]:
             return "LOW"
             

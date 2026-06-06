@@ -50,6 +50,10 @@ class LongTermMemory(Base):
     expires_at = Column(DateTime(timezone=True), nullable=True)
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
     source_session_id = Column(String, nullable=True)
+    vector = Column(Text, nullable=True)
+    embedding_model = Column(String, nullable=True)
+    last_accessed = Column(DateTime(timezone=True), nullable=True)
+    retrieval_count = Column(Integer, default=0)
 
 
 class ScheduledTask(Base):

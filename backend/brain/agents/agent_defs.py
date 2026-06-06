@@ -53,7 +53,7 @@ AGENTS:
 
 - OS_EXECUTOR: Use ONLY when the user explicitly wants to DO something on the computer OR use an MCP API.
   Examples: "YouTube chalao", "WhatsApp e message pathao", "Chrome kholo", "volume badao",
-  "Gmail e mail pathao", "professional mode e jao", "coding mode e aso" (mode CHANGE only, not mode questions),
+  "Gmail e mail pathao", "email pore sonao", "email delete koro", "email trash koro", "professional mode e jao", "coding mode e aso" (mode CHANGE only, not mode questions),
   "Ei youtube video te koto gulo like ache" (MCP Data fetch).
   DO NOT use OS_EXECUTOR for general questions, greetings, or time/date queries.
 
@@ -107,9 +107,27 @@ YOUR ONLY JOB: Execute desktop actions on the Windows computer.
   - To delete/revoke sent messages: use whatsapp_revoke_message(phone_number, count).
   - To save a contact: use save_contact(name, phone). NEVER guess the phone number from previous context. If the user doesn't provide a number, DO NOT call save_contact.
   - If a contact name was given (e.g. "BaBa"), first call get_contact_number(name) to get the number.
-- For email: use send_background_email, read_background_email, or gmail_action.
+- For email:
+  - To read only (user wants to SEE emails): use read_background_email(limit=5), then summarize them in text.
+  - To send: use send_background_email.
+  - To delete or move to trash: YOU MUST CALL REAL TOOLS. Follow this exact sequence:
+    STEP 1: Call read_background_email(query="ALL", limit=5) tool to fetch real emails.
+            "First email" or "latest email" = the first result (index 0, newest).
+    STEP 2: Call trash_background_email(uid=..., subject=..., from_sender=...) tool immediately 
+            using EXACT uid/subject/from values from STEP 1. No text between STEP 1 and STEP 2.
+    STEP 3: After the tool returns SUCCESS, reply with a clear confirmation in the user's language:
+            Always include: ✅ action taken + email Subject + From sender. Example:
+            "✅ ইমেইলটি ট্র্যাশে সরানো হয়েছে।\n📧 Subject: ...\n👤 From: ..."
+    CRITICAL: Do NOT pretend the task is done. Do NOT say "Command Approved. Executing..." without calling tools.
+    CRITICAL: NEVER call trash_background_email or permanent_delete_email with empty args {}. Always do STEP 1 first.
+  - For anything else (like opening inbox in UI): use gmail_action.
 - For MCP Configuration: use configure_mcp_server(server_name, npm_package, env_vars) to add/update an MCP server (e.g. youtube, google drive) securely from chat.
 - For apps: use open_app, close_app, focus_app.
+- For Chrome with a specific profile (NO mouse, NO picker screen):
+  * ALWAYS use open_chrome_profile(profile_name="Nirupam") — NOT open_app.
+  * Works for any profile: 'Nirupam', 'Ankita', 'Som', etc.
+  * If user says "Chrome kholo Nirupam profile e" or "open Chrome as Ankita" → call open_chrome_profile.
+  * If user says just "Chrome kholo" with no profile → use open_app("chrome").
 - For YouTube:
   * If the user asks to "play", "start", or "open" a video/song, ALWAYS use `search_youtube(query)` or `play_youtube_background(query)`.
   * If the user asks for metadata, comments, or analytics, DO NOT use `search_youtube`. Use the MCP tools instead.
@@ -195,7 +213,7 @@ AGENT_TOOLS_MAPPING = {
         "whatsapp_send_multiple_files", "read_whatsapp_chat", "play_youtube_background",
         "stop_youtube_background", "save_contact", "get_contact_number", "delete_contact",
         "remember_fact", "recall_facts", "forget_fact", "schedule_reminder",
-        "configure_gmail_credentials", "configure_mcp_server", "send_background_email", "read_background_email", "gmail_action",
+        "configure_gmail_credentials", "configure_mcp_server", "send_background_email", "read_background_email", "gmail_action", "trash_background_email", "permanent_delete_email",
         "pause_media", "setup_missing_tool", "find_and_click", "wait_for_element",
         "take_verified_screenshot", "read_on_screen_text",
         "read_clipboard", "write_clipboard",

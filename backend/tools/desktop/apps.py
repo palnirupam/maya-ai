@@ -275,3 +275,107 @@ def list_open_apps() -> str:
         return "No visible windows found."
     except Exception as e:
         return f"ERROR: {e}"
+
+
+def open_chrome_profile(profile_name: str) -> str:
+    """
+    Opens Google Chrome directly with a specific user profile — NO mouse, NO profile picker screen.
+    Reads Chrome's Local State file to find the correct profile folder, then launches Chrome
+    with --profile-directory flag so the profile picker screen never appears.
+
+    Args:
+        profile_name (str): The display name of the Chrome profile to open.
+                           Examples: 'Nirupam', 'Ankita', 'Som', 'Default', 'Guest'
+
+    Returns: SUCCESS or ERROR string.
+    """
+    import json
+
+    # ── Step 1: Find Chrome executable ───────────────────────────────────────
+    chrome_paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+    ]
+    chrome_exe = None
+    for p in chrome_paths:
+        if os.path.exists(p):
+            chrome_exe = p
+            break
+    if not chrome_exe:
+        return "ERROR: Chrome executable not found."
+
+    # ── Step 2: Read Chrome's Local State to find profiles ───────────────────
+    local_state_path = os.path.expandvars(
+        r"%LOCALAPPDATA%\Google\Chrome\User Data\Local State"
+    )
+    if not os.path.exists(local_state_path):
+        return "ERROR: Chrome Local State file not found. Is Chrome installed?"
+
+    try:
+        with open(local_state_path, "r", encoding="utf-8") as f:
+            local_state = json.load(f)
+        profiles_info = local_state.get("profile", {}).get("info_cache", {})
+    except Exception as e:
+        return f"ERROR: Could not read Chrome profiles: {e}"
+
+    if not profiles_info:
+        return "ERROR: No Chrome profiles found."
+
+    # ── Step 3: Fuzzy match profile name ─────────────────────────────────────
+    name_clean = profile_name.strip().lower()
+
+    # Build match candidates: folder → display name
+    candidates = {}
+    for folder, info in profiles_info.items():
+        display = info.get("name", "").strip()
+        email   = info.get("user_name", "").strip()
+        candidates[folder] = {"name": display, "email": email}
+
+    # Try exact match first
+    matched_folder = None
+    matched_name   = None
+    for folder, info in candidates.items():
+        if info["name"].lower() == name_clean:
+            matched_folder = folder
+            matched_name   = info["name"]
+            break
+
+    # Fuzzy match if no exact match
+    if not matched_folder:
+        try:
+            from rapidfuzz import process, fuzz
+            all_names = {folder: info["name"] for folder, info in candidates.items()}
+            result = process.extractOne(
+                name_clean,
+                all_names,
+                scorer=fuzz.partial_ratio,
+                score_cutoff=60,
+                processor=str.lower,
+            )
+            if result:
+                matched_name, score, matched_folder = result
+                logger.info(f"Chrome profile fuzzy match: '{profile_name}' → '{matched_name}' (folder: {matched_folder}, score: {score:.0f})")
+        except ImportError:
+            pass
+
+    if not matched_folder:
+        # List available profiles in error message
+        available = ", ".join(f"'{i['name']}'" for i in candidates.values())
+        return (
+            f"ERROR: No Chrome profile matching '{profile_name}' found.\n"
+            f"Available profiles: {available}"
+        )
+
+    # ── Step 4: Launch Chrome with profile flag (NO mouse, NO picker!) ────────
+    try:
+        cmd = [chrome_exe, f"--profile-directory={matched_folder}"]
+        subprocess.Popen(cmd)
+        logger.info(f"Chrome launched with profile '{matched_name}' (folder: {matched_folder})")
+        return (
+            f"SUCCESS: Chrome opened with profile '{matched_name}'.\n"
+            f"Profile folder: {matched_folder}"
+        )
+    except Exception as e:
+        return f"ERROR: Failed to launch Chrome with profile '{matched_name}': {e}"
+

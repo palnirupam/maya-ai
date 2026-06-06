@@ -2,8 +2,8 @@ from ...tools.desktop.mouse import mouse_tools
 from ...tools.desktop.keyboard import keyboard_tools
 from ...vision.capture.screen_capture import screen_capture
 
-from ...tools.desktop.apps import open_app, close_app, focus_app, list_open_apps
-from ...tools.desktop.advanced.browser_tools import open_url, search_youtube, search_google, gmail_action, send_background_email, read_background_email
+from ...tools.desktop.apps import open_app, close_app, focus_app, list_open_apps, open_chrome_profile
+from ...tools.desktop.advanced.browser_tools import open_url, search_youtube, search_google, gmail_action, send_background_email, read_background_email, trash_background_email, permanent_delete_email
 from ...tools.desktop.advanced.playwright_browser import playwright_navigate, playwright_click, playwright_type, playwright_screenshot, playwright_get_content, playwright_close, playwright_upload_file
 from ...tools.desktop.advanced.google_meet_tools import google_meet_join, google_meet_leave
 from ...tools.desktop.advanced.google_classroom_tools import classroom_list_assignments, classroom_upload_file
@@ -87,7 +87,7 @@ def change_interaction_mode(mode: str) -> str:
 # Mapping of capability keys to the actual Python functions
 CAPABILITY_MAP = {
     "PERM_BROWSER": [
-        open_url, search_youtube, search_google, gmail_action, send_background_email, read_background_email,
+        open_url, search_youtube, search_google, gmail_action, send_background_email, read_background_email, trash_background_email, permanent_delete_email,
         playwright_navigate, playwright_click, playwright_type,
         playwright_screenshot, playwright_get_content, playwright_close,
         playwright_upload_file, google_meet_join, google_meet_leave,
@@ -96,7 +96,7 @@ CAPABILITY_MAP = {
     "PERM_FILESYSTEM": [create_file, read_file, list_directory, delete_file, search_local_files],
     "PERM_TERMINAL": [execute_powershell, execute_python],
     "PERM_SYSTEM": [
-        open_app, close_app, focus_app, list_open_apps,
+        open_app, close_app, focus_app, list_open_apps, open_chrome_profile,
         get_active_windows, change_volume, read_clipboard, write_clipboard,
         get_system_stats, manage_processes, read_on_screen_text,
         whatsapp_call, whatsapp_send_message, whatsapp_revoke_message, whatsapp_get_pairing_code,
@@ -120,7 +120,7 @@ def get_maya_tools() -> list:
         look_at_screen, manage_system_state, change_interaction_mode,
         remember_fact, recall_facts, forget_fact, schedule_reminder, configure_gmail_credentials, configure_mcp_server,
         # App management is always available (no special permission needed)
-        open_app, close_app, focus_app, list_open_apps, is_app_open,
+        open_app, close_app, focus_app, list_open_apps, is_app_open, open_chrome_profile,
         read_active_window_title,
         # Contact Manager
         save_contact, get_contact_number,

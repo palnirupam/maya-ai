@@ -1,5 +1,5 @@
 """
-Maya SKILL.md Loader — OpenClaw-style markdown-based skill system.
+Maya SKILL.md Loader — Markdown-based skill system.
 
 How it works:
   1. Each skill lives in its own folder:  builtin/<name>/SKILL.md
@@ -13,8 +13,8 @@ How it works:
 Priority (highest wins on name conflict):
   user_skills  >  builtin
 
-Compared to OpenClaw:
-  • Same SKILL.md format and precedence model
+Design:
+  • Standard SKILL.md format and precedence model
   • Maya-specific: skills are injected per-session at orchestrator level
   • Builtin skills only cover workflows NOT already in maya_personality.py
 """

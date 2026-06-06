@@ -2,6 +2,74 @@ import webbrowser
 import urllib.parse
 import subprocess
 import os
+import asyncio
+import threading
+
+# ── IMAP Connection Pool ──────────────────────────────────────────────────────
+# Reuses a single IMAP connection instead of reconnecting per tool call
+# Saves ~1-2s SSL handshake + login time per email operation
+class _IMAPPool:
+    def __init__(self):
+        self._conn = None
+        self._lock = threading.Lock()
+        self._user = None
+
+    def _get_credentials(self):
+        """Fetch Gmail credentials from env or DB."""
+        import os
+        gmail_user = os.getenv("GMAIL_EMAIL")
+        gmail_password = os.getenv("GMAIL_APP_PASSWORD")
+        if not gmail_user or not gmail_password:
+            from backend.database.connection import SessionLocal
+            from backend.database.models import UserPreferences
+            from backend.database.crypto import crypto_manager
+            db = SessionLocal()
+            try:
+                e = db.query(UserPreferences).filter(UserPreferences.key == "GMAIL_EMAIL").first()
+                p = db.query(UserPreferences).filter(UserPreferences.key == "GMAIL_APP_PASSWORD").first()
+                if e and p:
+                    gmail_user = crypto_manager.decrypt(e.value)
+                    gmail_password = crypto_manager.decrypt(p.value)
+            finally:
+                db.close()
+        return gmail_user, gmail_password
+
+    def get(self):
+        """Return a live IMAP connection, reconnecting if needed."""
+        import imaplib
+        with self._lock:
+            # Test existing connection with NOOP
+            if self._conn is not None:
+                try:
+                    self._conn.noop()
+                    return self._conn  # reuse ✅
+                except Exception:
+                    self._conn = None  # stale, reconnect
+
+            # Fresh connection
+            user, pwd = self._get_credentials()
+            if not user or not pwd:
+                raise RuntimeError("Gmail credentials not configured.")
+            mail = imaplib.IMAP4_SSL("imap.gmail.com")
+            mail.login(user, pwd)
+            self._conn = mail
+            self._user = user
+            return mail
+
+    def invalidate(self):
+        """Force reconnect on next get()."""
+        with self._lock:
+            try:
+                if self._conn:
+                    self._conn.logout()
+            except Exception:
+                pass
+            self._conn = None
+
+_imap_pool = _IMAPPool()
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 
 def open_url(url: str) -> str:
     """
@@ -217,7 +285,8 @@ async def read_background_email(limit: int = 5, unread_only: bool = True, query:
     if query:
         valid_query_pattern = r'^(?:(?:UNSEEN|ALL|FROM\s+"[^"]+"|SUBJECT\s+"[^"]+"|TO\s+"[^"]+")(?:\s+|$))+$'
         if not re.fullmatch(valid_query_pattern, query.strip(), re.IGNORECASE):
-            return "ERROR: Invalid IMAP search query. Allowed terms are UNSEEN, ALL, FROM \"...\", SUBJECT \"...\", TO \"...\"."
+            # Fallback to ALL if the LLM passes a weird query (like "First email")
+            query = "ALL"
     else:
         query = "UNSEEN" if unread_only else "ALL"
 
@@ -254,11 +323,10 @@ async def read_background_email(limit: int = 5, unread_only: bool = True, query:
             return "ERROR: BeautifulSoup4 is required for HTML stripping. Please install beautifulsoup4."
 
         try:
-            mail = imaplib.IMAP4_SSL("imap.gmail.com")
-            mail.login(gmail_user, gmail_password)
+            mail = _imap_pool.get()
             mail.select("inbox")
 
-            status, messages = mail.search(None, query)
+            status, messages = mail.uid("SEARCH", None, query)
             if status != "OK":
                 return f"ERROR: IMAP search failed."
             
@@ -271,7 +339,7 @@ async def read_background_email(limit: int = 5, unread_only: bool = True, query:
 
             extracted_emails = []
             for m_id in latest_ids:
-                res, msg_data = mail.fetch(m_id, "(RFC822)")
+                res, msg_data = mail.uid("FETCH", m_id, "(RFC822)")
                 if res != "OK":
                     continue
                     
@@ -328,6 +396,8 @@ async def read_background_email(limit: int = 5, unread_only: bool = True, query:
                             body_content = re.sub(r'\n\s*\n', '\n\n', text).strip()
                             
                         extracted_emails.append({
+                            "uid": m_id.decode("utf-8", errors="ignore"),
+                            "message_id": msg.get("Message-ID", "Unknown"),
                             "subject": subject,
                             "from": from_hdr,
                             "date": date_str,
@@ -348,7 +418,7 @@ async def read_background_email(limit: int = 5, unread_only: bool = True, query:
             
             response_text = framing_prefix
             for i, em in enumerate(extracted_emails, 1):
-                response_text += f"<EMAIL id=\"{i}\">\n"
+                response_text += f"<EMAIL uid=\"{em['uid']}\" message_id=\"{em['message_id']}\">\n"
                 response_text += f"  <SUBJECT>{em['subject']}</SUBJECT>\n"
                 response_text += f"  <FROM>{em['from']}</FROM>\n"
                 response_text += f"  <DATE>{em['date']}</DATE>\n"
@@ -361,3 +431,227 @@ async def read_background_email(limit: int = 5, unread_only: bool = True, query:
             return f"ERROR: Failed to read emails: {e}"
 
     return await asyncio.to_thread(_sync_imap_read)
+
+async def trash_background_email(uid: str, subject: str, from_sender: str) -> str:
+    """
+    Moves an email to the Trash/Bin folder via IMAP using the user's saved Gmail credentials.
+    
+    Args:
+        uid (str): The unique identifier of the email to delete. You MUST use read_background_email first to get this. Do NOT guess or hallucinate this.
+        subject (str): The exact subject of the email (used for safety verification).
+        from_sender (str): The exact sender of the email (used for safety verification).
+        
+    WARNING: You CANNOT call this function with empty arguments. You MUST use read_background_email first to get the UID, Subject, and Sender.
+    """
+    # Hard enforcement: block calls with empty/missing arguments
+    if not uid or not uid.strip():
+        return "ERROR: uid is required. You MUST call read_background_email first to get the email UID before calling trash_background_email."
+    if not subject or not subject.strip():
+        return "ERROR: subject is required. You MUST call read_background_email first to get the email subject before calling trash_background_email."
+    if not from_sender or not from_sender.strip():
+        return "ERROR: from_sender is required. You MUST call read_background_email first to get the sender before calling trash_background_email."
+
+    def _sync_trash():
+        from backend.database.connection import SessionLocal
+        from backend.database.models import UserPreferences
+        from backend.database.crypto import crypto_manager
+        import imaplib
+        import email
+        from email.header import decode_header
+        
+        gmail_user = os.getenv("GMAIL_EMAIL")
+        gmail_password = os.getenv("GMAIL_APP_PASSWORD")
+
+        if not gmail_user or not gmail_password:
+            db = SessionLocal()
+            try:
+                email_pref = db.query(UserPreferences).filter(UserPreferences.key == "GMAIL_EMAIL").first()
+                pass_pref = db.query(UserPreferences).filter(UserPreferences.key == "GMAIL_APP_PASSWORD").first()
+                if email_pref and pass_pref:
+                    gmail_user = crypto_manager.decrypt(email_pref.value)
+                    gmail_password = crypto_manager.decrypt(pass_pref.value)
+            except Exception as db_err:
+                return f"ERROR: Failed to fetch credentials from DB. {db_err}"
+            finally:
+                db.close()
+
+        if not gmail_user or not gmail_password:
+            return "ERROR: Gmail credentials not configured."
+            
+        try:
+            mail = _imap_pool.get()
+            mail.select("inbox")
+            
+            # 1. Pre-execution Verification
+            res, msg_data = mail.uid("FETCH", uid.encode("utf-8"), "(RFC822)")
+            if res != "OK" or not msg_data or msg_data == [None]:
+                _imap_pool.invalidate()
+                return f"ERROR: Verification failed. Could not fetch email with UID {uid}."
+
+                
+            verified = False
+            message_id = "Unknown"
+            for response_part in msg_data:
+                if isinstance(response_part, tuple):
+                    msg = email.message_from_bytes(response_part[1])
+                    
+                    message_id = msg.get("Message-ID", "Unknown")
+                    
+                    fetched_subj, encoding = decode_header(msg["Subject"])[0] if msg["Subject"] else ("No Subject", None)
+                    if isinstance(fetched_subj, bytes):
+                        fetched_subj = fetched_subj.decode(encoding if encoding else "utf-8", errors="ignore")
+                        
+                    fetched_from, encoding = decode_header(msg.get("From", ""))[0] if msg.get("From") else ("Unknown", None)
+                    if isinstance(fetched_from, bytes):
+                        fetched_from = fetched_from.decode(encoding if encoding else "utf-8", errors="ignore")
+                        
+                    if subject.strip().lower() in fetched_subj.strip().lower() and from_sender.strip().lower() in fetched_from.strip().lower():
+                        verified = True
+                    break
+                    
+            if not verified:
+                mail.logout()
+                return "ERROR: Verification failed. The provided Subject or Sender does not match the target email. Deletion BLOCKED."
+
+            # 2. Dynamic Folder Discovery for Trash
+            status, folders = mail.list()
+            trash_folder = "[Gmail]/Trash"  # Fallback
+            if status == "OK":
+                for f in folders:
+                    folder_name = f.decode("utf-8").split(' "/" ')[-1].strip('"')
+                    lower_name = folder_name.lower()
+                    if lower_name in ["trash", "bin", "deleted items", "[gmail]/trash", "[gmail]/bin", "inbox.trash"]:
+                        trash_folder = folder_name
+                        break
+
+            # 3. Execute Move to Trash
+            copy_status, _ = mail.uid("COPY", uid.encode("utf-8"), f'"{trash_folder}"')
+            if copy_status == "OK":
+                mail.uid("STORE", uid.encode("utf-8"), "+FLAGS", "\\Deleted")
+                
+                # Safe Expunge using UIDPLUS to prevent deleting other flagged emails
+                status_cap, response_cap = mail.capability()
+                caps = response_cap[0].decode("utf-8") if response_cap and response_cap[0] else ""
+                if "UIDPLUS" in caps:
+                    mail.uid("EXPUNGE", uid.encode("utf-8"))
+                else:
+                    mail.expunge()
+                    
+                mail.logout()
+                
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(f"AUDIT: trash_background_email executed. UID: {uid}, Message-ID: {message_id}, Subject: {subject}, To Trash: {trash_folder}")
+                return f"SUCCESS: Email UID {uid} has been verified and moved to {trash_folder}."
+            else:
+                mail.logout()
+                return "ERROR: Failed to copy the email to the Trash folder."
+                
+        except Exception as e:
+            return f"ERROR: Failed to move email to trash: {e}"
+
+    return await asyncio.to_thread(_sync_trash)
+
+async def permanent_delete_email(uid: str, subject: str, from_sender: str) -> str:
+    """
+    PERMANENTLY deletes an email via IMAP using the user's saved Gmail credentials.
+    This bypasses the Trash folder. 
+    
+    Args:
+        uid (str): The unique identifier of the email to delete. You MUST use read_background_email first to get this. Do NOT guess or hallucinate this.
+        subject (str): The exact subject of the email (used for safety verification).
+        from_sender (str): The exact sender of the email (used for safety verification).
+        
+    WARNING: You CANNOT call this function with empty arguments. You MUST use read_background_email first to get the UID, Subject, and Sender.
+    """
+    # Hard enforcement: block calls with empty/missing arguments
+    if not uid or not uid.strip():
+        return "ERROR: uid is required. You MUST call read_background_email first to get the email UID before calling permanent_delete_email."
+    if not subject or not subject.strip():
+        return "ERROR: subject is required. You MUST call read_background_email first to get the email subject before calling permanent_delete_email."
+    if not from_sender or not from_sender.strip():
+        return "ERROR: from_sender is required. You MUST call read_background_email first to get the sender before calling permanent_delete_email."
+
+    def _sync_perm_delete():
+        from backend.database.connection import SessionLocal
+        from backend.database.models import UserPreferences
+        from backend.database.crypto import crypto_manager
+        import imaplib
+        import email
+        from email.header import decode_header
+        
+        gmail_user = os.getenv("GMAIL_EMAIL")
+        gmail_password = os.getenv("GMAIL_APP_PASSWORD")
+
+        if not gmail_user or not gmail_password:
+            db = SessionLocal()
+            try:
+                email_pref = db.query(UserPreferences).filter(UserPreferences.key == "GMAIL_EMAIL").first()
+                pass_pref = db.query(UserPreferences).filter(UserPreferences.key == "GMAIL_APP_PASSWORD").first()
+                if email_pref and pass_pref:
+                    gmail_user = crypto_manager.decrypt(email_pref.value)
+                    gmail_password = crypto_manager.decrypt(pass_pref.value)
+            except Exception as db_err:
+                return f"ERROR: Failed to fetch credentials from DB. {db_err}"
+            finally:
+                db.close()
+
+        if not gmail_user or not gmail_password:
+            return "ERROR: Gmail credentials not configured."
+            
+        try:
+            mail = _imap_pool.get()
+            mail.select("inbox")
+            
+            # 1. Pre-execution Verification
+            res, msg_data = mail.uid("FETCH", uid.encode("utf-8"), "(RFC822)")
+            if res != "OK" or not msg_data or msg_data == [None]:
+                mail.logout()
+                return f"ERROR: Verification failed. Could not fetch email with UID {uid}."
+                
+            verified = False
+            message_id = "Unknown"
+            for response_part in msg_data:
+                if isinstance(response_part, tuple):
+                    msg = email.message_from_bytes(response_part[1])
+                    
+                    message_id = msg.get("Message-ID", "Unknown")
+                    
+                    fetched_subj, encoding = decode_header(msg["Subject"])[0] if msg["Subject"] else ("No Subject", None)
+                    if isinstance(fetched_subj, bytes):
+                        fetched_subj = fetched_subj.decode(encoding if encoding else "utf-8", errors="ignore")
+                        
+                    fetched_from, encoding = decode_header(msg.get("From", ""))[0] if msg.get("From") else ("Unknown", None)
+                    if isinstance(fetched_from, bytes):
+                        fetched_from = fetched_from.decode(encoding if encoding else "utf-8", errors="ignore")
+                        
+                    if subject.strip().lower() in fetched_subj.strip().lower() and from_sender.strip().lower() in fetched_from.strip().lower():
+                        verified = True
+                    break
+                    
+            if not verified:
+                mail.logout()
+                return "ERROR: Verification failed. The provided Subject or Sender does not match the target email. Deletion BLOCKED."
+
+            # 2. Execute Permanent Delete
+            mail.uid("STORE", uid.encode("utf-8"), "+FLAGS", "\\Deleted")
+            
+            # Safe Expunge using UIDPLUS to prevent deleting other flagged emails
+            status_cap, response_cap = mail.capability()
+            caps = response_cap[0].decode("utf-8") if response_cap and response_cap[0] else ""
+            if "UIDPLUS" in caps:
+                mail.uid("EXPUNGE", uid.encode("utf-8"))
+            else:
+                mail.expunge()
+                
+            mail.logout()
+            
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"AUDIT: permanent_delete_email executed. UID: {uid}, Message-ID: {message_id}, Subject: {subject}")
+            return f"SUCCESS: Email UID {uid} has been verified and PERMANENTLY DELETED."
+                
+        except Exception as e:
+            return f"ERROR: Failed to permanently delete email: {e}"
+
+    return await asyncio.to_thread(_sync_perm_delete)

@@ -148,6 +148,7 @@ class PromptBuilder:
             self.tool_rules + "\n" +
             capabilities + "\n" +
             mode_tone + "\n" +
+            self.bengali_phonetic_rules + "\n" +
             app_directive + "\n" +
             _time_block
         )

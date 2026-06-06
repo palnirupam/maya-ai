@@ -9,6 +9,8 @@ from ..gemini.function_calls import get_maya_tools
 from ..reasoning.tool_planner import tool_planner
 from ..security_filter import sanitizer
 
+import re
+
 logger = logging.getLogger(__name__)
 
 # Maximum characters for a single tool output to prevent context blowup
@@ -17,8 +19,42 @@ MAX_TOOL_OUTPUT_CHARS = 3000
 # Tools requiring explicit user approval before execution
 DANGER_TOOLS = [
     "execute_python", "execute_powershell", "delete_file",
+    "trash_background_email", "permanent_delete_email",
     "manage_system_state", "manage_processes"
 ]
+
+# ── Fast keyword-based router (avoids Gemini API call) ───────────────────────
+# Patterns that ALWAYS go to OS_EXECUTOR — no LLM needed
+_OS_PATTERNS = re.compile(
+    r"(whatsapp|telegram|email|mail|gmail|youtube|chrome|open |close |volume|brightness"
+    r"|screenshot|screen|type |click|trash|delete|send.*message|pathao|chalao|bondho|kholo"
+    r"|download|install|reminder|schedule|contact|save|recall|forget|skill|mcp|mode.*change"
+    r"|professional mode|friendly mode|coding mode|clipboard|process|app "
+    r"|select |profile|switch |scroll|press |minimize|maximize|window|browser"
+    r"|play |pause|stop |mute|unmute|tab |shortcut|hotkey|drag|resize"
+    r"|notif|alarm|timer|khulje|chalao|band koro|kholo|dekho|snapshot)",
+    re.IGNORECASE
+)
+# Patterns that ALWAYS go to RESEARCHER
+_RESEARCH_PATTERNS = re.compile(
+    r"(search|খুজ|খোঁজ|news|khabor|খবর|latest|current|today.*news|find online|google it"
+    r"|what is|who is|weather|stock|price of)",
+    re.IGNORECASE
+)
+
+def _fast_route(text: str) -> list[str] | None:
+    """Returns agent list instantly from keywords, or None to fall back to Gemini router."""
+    t = text.lower()
+    if _OS_PATTERNS.search(t):
+        return ["OS_EXECUTOR"]
+    if _RESEARCH_PATTERNS.search(t):
+        return ["RESEARCHER"]
+    # Only route very short greetings to CHAT instantly (≤3 words, no question words)
+    words = text.split()
+    if len(words) <= 3 and not any(c in t for c in ["?", "কি", "কেন", "কোথায়", "কখন", "what", "why", "how", "where"]):
+        return ["CHAT"]
+    return None  # ambiguous → use Gemini router
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _build_agent_context(
@@ -123,34 +159,39 @@ async def execute_workflow(
     logger.info(f"Multi-agent workflow routing request: {text}")
 
     # ── 1. Routing phase ─────────────────────────────────────────────────────
-    routing_context = [
-        {"role": "system", "content": ROUTING_PROMPT},
-        {"role": "user", "content": f"Request: {text}"}
-    ]
+    # Try fast keyword router first (saves ~1-2s Gemini call)
+    agents_to_run = _fast_route(text)
+    if agents_to_run:
+        logger.info(f"Router response (fast-route): {agents_to_run}")
+    else:
+        # Fall back to Gemini router for ambiguous messages
+        routing_context = [
+            {"role": "system", "content": ROUTING_PROMPT},
+            {"role": "user", "content": f"Request: {text}"}
+        ]
+        routing_response = ""
+        try:
+            routing_response = await gemini_adapter.generate_response(
+                routing_context, f"Request: {text}", override_tools=[]
+            )
+            logger.info(f"Router response (gemini): {routing_response}")
 
-    routing_response = ""
-    try:
-        routing_response = await gemini_adapter.generate_response(
-            routing_context, f"Request: {text}", override_tools=[]
-        )
-        logger.info(f"Router response: {routing_response}")
+            cleaned_resp = routing_response.strip()
+            if "```" in cleaned_resp:
+                cleaned_resp = cleaned_resp.split("```")[1]
+                if cleaned_resp.startswith("json"):
+                    cleaned_resp = cleaned_resp[4:]
+                cleaned_resp = cleaned_resp.strip()
 
-        cleaned_resp = routing_response.strip()
-        if "```" in cleaned_resp:
-            cleaned_resp = cleaned_resp.split("```")[1]
-            if cleaned_resp.startswith("json"):
-                cleaned_resp = cleaned_resp[4:]
-            cleaned_resp = cleaned_resp.strip()
-
-        parsed = json.loads(cleaned_resp)
-        agents_to_run = parsed.get("agents", [])
-    except Exception as e:
-        logger.warning(f"Failed to parse agent routing JSON. Error: {e}")
-        agents_to_run = []
-        if routing_response:
-            for agent_name in ["RESEARCHER", "CODER", "OS_EXECUTOR"]:
-                if agent_name in routing_response.upper():
-                    agents_to_run.append(agent_name)
+            parsed = json.loads(cleaned_resp)
+            agents_to_run = parsed.get("agents", [])
+        except Exception as e:
+            logger.warning(f"Failed to parse agent routing JSON. Error: {e}")
+            agents_to_run = []
+            if routing_response:
+                for agent_name in ["RESEARCHER", "CODER", "OS_EXECUTOR"]:
+                    if agent_name in routing_response.upper():
+                        agents_to_run.append(agent_name)
 
     cleaned_agents = []
     for agent in agents_to_run:
@@ -344,10 +385,11 @@ async def execute_workflow(
                         try:
                             approved = await asyncio.wait_for(
                                 tool_planner.wait_for_approval(req["request_id"]),
-                                timeout=60.0
+                                timeout=300.0  # 5 minutes for user to approve
                             )
                         except asyncio.TimeoutError:
                             approved = False
+                            logger.warning(f"[agent_team] Approval timeout for {func_name}. Auto-denying.")
 
                 # ── Execute tool ──────────────────────────────────────
                 if approved:

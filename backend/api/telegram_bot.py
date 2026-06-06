@@ -468,7 +468,20 @@ class TelegramBotManager:
                             data = chunk.get("data", {})
                             req_id = data.get("request_id")
                             tool_name = data.get("tool_name", "unknown")
-                            args = data.get("args", {})
+                            args = data.get("args") or data.get("payload", {})
+                            risk_level = data.get("risk_level", "UNKNOWN")
+                            
+                            # Build a human-friendly display for email deletion tools
+                            if tool_name in ("trash_background_email", "permanent_delete_email") and args:
+                                uid = args.get("uid", "?")
+                                subject = args.get("subject", "?")
+                                from_s = args.get("from_sender", "?")
+                                action_label = "🗑️ Move to Trash" if tool_name == "trash_background_email" else "💀 Permanently Delete"
+                                args_display = f"{action_label}\n\n📧 *Subject:* `{subject}`\n👤 *From:* `{from_s}`\n🔑 *UID:* `{uid}`"
+                            else:
+                                args_display = f"```json\n{json.dumps(args, indent=2, ensure_ascii=False)}\n```"
+
+                            risk_emoji = {"HIGH": "🟠", "CRITICAL": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(risk_level, "⚪")
                             
                             markup = {
                                 "inline_keyboard": [[
@@ -478,7 +491,7 @@ class TelegramBotManager:
                             }
                             await self._send_message(
                                 chat_id,
-                                f"⚠️ *Maya Exec Approval*\n\nMaya wants to run: `{tool_name}`\nArguments:\n```json\n{json.dumps(args, indent=2)}\n```\n\nDo you approve?",
+                                f"{risk_emoji} *Maya Exec Approval* ({risk_level})\n\nMaya wants to run: `{tool_name}`\n\n{args_display}\n\nDo you approve?",
                                 reply_markup=markup
                             )
                         continue

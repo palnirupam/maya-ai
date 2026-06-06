@@ -413,7 +413,7 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
             <div className="space-y-5 mt-1">
               <div>
                 <h3 className="text-white font-semibold text-sm mb-0.5">Telegram Bot Control</h3>
-                <p className="text-slate-400 text-xs mb-3">Command Maya AI from your phone using Telegram (like OpenClaw).</p>
+                <p className="text-slate-400 text-xs mb-3">Command Maya AI from your phone using Telegram.</p>
               </div>
 
               {/* Enable Toggle */}
