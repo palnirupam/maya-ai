@@ -3,6 +3,8 @@ import sys
 import json
 import numpy as np
 
+sys.stdout.reconfigure(encoding='utf-8')
+
 # Add backend to path
 sys.path.append("c:\\maya-ai")
 from backend.database.connection import SessionLocal

@@ -1,0 +1,22 @@
+{
+  "on_session_start": {
+    "enabled": false,
+    "timeout": 30,
+    "script": "hooks/on_session_start.py"
+  },
+  "on_command_approval_request": {
+    "enabled": false,
+    "timeout": 30,
+    "script": "hooks/on_command_approval_request.py"
+  },
+  "on_command_approval_decision": {
+    "enabled": false,
+    "timeout": 30,
+    "script": "hooks/on_command_approval_decision.py"
+  },
+  "on_sensitive_app_detected": {
+    "enabled": false,
+    "timeout": 30,
+    "script": "hooks/on_sensitive_app_detected.py"
+  }
+}

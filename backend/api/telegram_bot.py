@@ -365,6 +365,15 @@ class TelegramBotManager:
         session_id = f"telegram_{chat_id}"
         if (existing := self._active_tasks.get(chat_id)) and not existing.done():
             existing.cancel()
+            
+        # Trigger on_session_start hook in the background
+        from backend.system.hooks import trigger_hook
+        asyncio.create_task(trigger_hook("on_session_start", {
+            "chat_id": chat_id,
+            "text": text,
+            "session_id": session_id
+        }))
+
         task = asyncio.create_task(
             self._process_and_reply(chat_id, text, session_id),
             name=f"tg-reply-{chat_id}",
@@ -407,6 +416,16 @@ class TelegramBotManager:
             req_id = data[len("exec_approve_"):]
             user_id = str(cq["from"].get("username", cq["from"].get("id", "telegram_user")))
             tool_planner.resolve_tool(req_id, approved=True, user_id=user_id)
+            
+            # Trigger on_command_approval_decision hook in the background
+            from backend.system.hooks import trigger_hook
+            asyncio.create_task(trigger_hook("on_command_approval_decision", {
+                "request_id": req_id,
+                "approved": True,
+                "user_id": user_id,
+                "chat_id": chat_id
+            }))
+
             await self._edit_message(
                 chat_id, str(cq["message"]["message_id"]),
                 "✅ *Command Approved.* Executing...",
@@ -416,6 +435,16 @@ class TelegramBotManager:
             req_id = data[len("exec_deny_"):]
             user_id = str(cq["from"].get("username", cq["from"].get("id", "telegram_user")))
             tool_planner.resolve_tool(req_id, approved=False, user_id=user_id)
+            
+            # Trigger on_command_approval_decision hook in the background
+            from backend.system.hooks import trigger_hook
+            asyncio.create_task(trigger_hook("on_command_approval_decision", {
+                "request_id": req_id,
+                "approved": False,
+                "user_id": user_id,
+                "chat_id": chat_id
+            }))
+
             await self._edit_message(
                 chat_id, str(cq["message"]["message_id"]),
                 "❌ *Command Denied.* Execution aborted.",
@@ -471,6 +500,16 @@ class TelegramBotManager:
                             args = data.get("args") or data.get("payload", {})
                             risk_level = data.get("risk_level", "UNKNOWN")
                             
+                            # Trigger on_command_approval_request hook in the background
+                            from backend.system.hooks import trigger_hook
+                            asyncio.create_task(trigger_hook("on_command_approval_request", {
+                                "request_id": req_id,
+                                "tool_name": tool_name,
+                                "args": args,
+                                "risk_level": risk_level,
+                                "chat_id": chat_id
+                            }))
+
                             # Build a human-friendly display for email deletion tools
                             if tool_name in ("trash_background_email", "permanent_delete_email") and args:
                                 uid = args.get("uid", "?")

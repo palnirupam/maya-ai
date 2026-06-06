@@ -28,6 +28,18 @@ class ScreenCapture:
                     title_lower = active_window.title.lower()
                     if any(kw in title_lower for kw in SENSITIVE_KEYWORDS):
                         logger.warning(f"Sensitive app detected ('{active_window.title}'). Capture aborted.")
+                        matching_kws = [kw for kw in SENSITIVE_KEYWORDS if kw in title_lower]
+                        matching_kw = matching_kws[0] if matching_kws else "unknown"
+                        import asyncio
+                        try:
+                            loop = asyncio.get_running_loop()
+                            from backend.system.hooks import trigger_hook
+                            loop.create_task(trigger_hook("on_sensitive_app_detected", {
+                                "app_title": active_window.title,
+                                "matched_keyword": matching_kw
+                            }))
+                        except RuntimeError:
+                            pass
                         return "ERROR_SENSITIVE_APP"
 
                     # Capture specific region (the active window)
@@ -80,6 +92,18 @@ class ScreenCapture:
                     title_lower = active_window.title.lower()
                     if any(kw in title_lower for kw in SENSITIVE_KEYWORDS):
                         logger.warning(f"Sensitive app detected ('{active_window.title}'). Capture aborted.")
+                        matching_kws = [kw for kw in SENSITIVE_KEYWORDS if kw in title_lower]
+                        matching_kw = matching_kws[0] if matching_kws else "unknown"
+                        import asyncio
+                        try:
+                            loop = asyncio.get_running_loop()
+                            from backend.system.hooks import trigger_hook
+                            loop.create_task(trigger_hook("on_sensitive_app_detected", {
+                                "app_title": active_window.title,
+                                "matched_keyword": matching_kw
+                            }))
+                        except RuntimeError:
+                            pass
                         return None, None
 
                     monitor = {

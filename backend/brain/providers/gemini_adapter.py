@@ -171,6 +171,7 @@ class GeminiAdapter(LLMProvider):
         
     def reload_key(self):
         """Loads key from DB (encrypted), falls back to .env, and configures genai/custom provider."""
+        fallback_manager.clear_all()
         db = SessionLocal()
         try:
             pref = db.query(UserPreferences).filter(UserPreferences.key == "GEMINI_API_KEY").first()
@@ -249,6 +250,43 @@ class GeminiAdapter(LLMProvider):
         finally:
             db.close()
             
+    async def probe_model(self, model_name: str) -> bool:
+        """Lightweight health probe of a model to check if it has recovered from cooldown."""
+        if not hasattr(self, "api_key") or not self.api_key:
+            return False
+            
+        if self.api_provider != "gemini":
+            try:
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 5
+                }
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(self.api_url, headers=headers, json=payload, timeout=10.0)
+                    return response.status_code == 200
+            except Exception as e:
+                logger.debug(f"[Fallback] Probe failed for custom provider model {model_name}: {e}")
+                return False
+        else:
+            if not self.client:
+                return False
+            try:
+                # Use generate_content with a simple string "ping" and max_output_tokens=5
+                await self.client.aio.models.generate_content(
+                    model=model_name,
+                    contents="ping",
+                    config=types.GenerateContentConfig(max_output_tokens=5)
+                )
+                return True
+            except Exception as e:
+                logger.debug(f"[Fallback] Probe failed for native Gemini model {model_name}: {e}")
+                return False
+
     async def generate_custom_response(self, context: list[dict], tools: list) -> str:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -694,3 +732,4 @@ class GeminiAdapter(LLMProvider):
             yield " I'm sorry, I encountered an error while thinking."
 
 gemini_adapter = GeminiAdapter()
+fallback_manager.register_probe_callback(gemini_adapter.probe_model)

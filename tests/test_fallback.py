@@ -1,6 +1,9 @@
 import asyncio
 import time
 import logging
+import sys
+
+sys.stdout.reconfigure(encoding='utf-8')
 
 logging.basicConfig(level=logging.INFO)
 
