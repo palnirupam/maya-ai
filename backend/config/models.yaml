@@ -1,0 +1,43 @@
+# ── Maya AI Model Configuration ─────────────────────────────────────────────
+# Rule: NEVER hardcode model strings in Python. Always read from here.
+# Rule: Verify exact API strings at https://ai.google.dev/gemini-api/docs/models
+#       before first production deploy. Update this file, not Python code.
+# Rule: model_version used in each request MUST be logged in RequestMetrics.
+
+models:
+  # Low-complexity: OS commands, greetings, simple recall
+  fast: "${MAYA_MODEL_FAST:-gemini-3.5-flash}"
+
+  # Medium-complexity: research, multi-tool, email
+  reasoning: "${MAYA_MODEL_REASONING:-gemini-3.1-pro}"
+
+  # High-complexity: multi-step planning, code generation, deep analysis
+  thinking: "${MAYA_MODEL_THINKING:-gemini-3.1-pro}"
+
+  # Embedding — gemini-embedding-2 is verified GA, 100+ languages, use as cloud fallback
+  embedding_cloud: "gemini-embedding-2"
+
+  # Local embedding
+  # Set to empty string to disable local and always use cloud
+  embedding_local: "${MAYA_EMBED_LOCAL:-}"
+
+thresholds:
+  fast_max_score: 2
+  reasoning_max_score: 6
+  thinking_min_score: 7
+
+cache_ttl_seconds:
+  wifi_list: 120
+  battery: 30
+  contact_number: 300
+  process_list: 60
+  default: 300
+
+retry:
+  max_attempts: 3          # Layer 6: per-tool retry cap
+  inject_failure_reason: true
+
+budget:
+  daily_token_limit: 500000      # 0 = unlimited
+  alert_at_percent: 80
+  safety_gates_immune: true      # NEVER let budget pressure touch confirmation gates

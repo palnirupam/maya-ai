@@ -15,6 +15,8 @@ import sys
 import importlib
 from pathlib import Path
 
+import pytest
+
 # Patch sys.path so we can import backend modules
 import os
 os.chdir(Path(__file__).parent.parent.parent)  # root of maya-ai
@@ -29,6 +31,24 @@ from backend.skills.skill_watcher import (
 SKILLS_DIR = Path("backend/skills")
 TEST_SKILL = SKILLS_DIR / "test_hello_skill.py"
 SETTLE_SECONDS = 1.5   # time for watchdog to fire & registry to update
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _skill_watcher():
+    """Start the watcher before these tests and stop it after.
+
+    Under pytest the ``__main__`` block below never runs, so without this
+    fixture the observer thread is never started (_OBSERVER stays None) and
+    every test fails. This mirrors what app startup does in production.
+    """
+    start_skill_watcher()
+    time.sleep(0.5)  # let the observer thread spin up
+    try:
+        yield
+    finally:
+        TEST_SKILL.unlink(missing_ok=True)
+        (SKILLS_DIR / "test_bad_skill.py").unlink(missing_ok=True)
+        stop_skill_watcher()
 
 
 def _wait_for(condition_fn, timeout=5.0, interval=0.1) -> bool:

@@ -4,7 +4,10 @@ import subprocess
 import platform
 from pathlib import Path
 
-LOG_DIR = Path("backend/logs")
+from backend.config.runtime_paths import BACKEND_ROOT, runtime_path
+
+
+LOG_DIR = runtime_path("MAYA_LOG_DIR", BACKEND_ROOT / "logs")
 LOG_FILE = LOG_DIR / "security_events.log"
 
 def setup_append_only_permissions(file_path: Path):
@@ -13,7 +16,7 @@ def setup_append_only_permissions(file_path: Path):
     preventing deletion or backward modification.
     Requires the file to exist.
     """
-    if platform.system() != "Windows":
+    if os.getenv("MAYA_TESTING") == "1" or platform.system() != "Windows":
         # On Linux/Mac, we might use chattr +a, but requires sudo.
         return
         

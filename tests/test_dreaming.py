@@ -8,7 +8,8 @@ logging.basicConfig(level=logging.WARNING)
 
 from backend.database.connection import SessionLocal
 from backend.database.models import SessionMemory, LongTermMemory
-from backend.brain.memory.compaction import run_dreaming_mode
+from backend.brain.memory.compaction import ARCHIVE_DIR, run_dreaming_mode
+from backend.brain.memory.session_security import decrypt_session_content, opaque_session_id
 from backend.database.crypto import crypto_manager
 
 async def test():
@@ -50,12 +51,17 @@ async def test():
             print(f" - [{cat}] {content} (Importance: {mem.importance})")
             
         # 5. Verify archive file
-        archive_path = f"archive/conversations/{test_session}.jsonl"
+        archive_path = os.path.join(
+            str(ARCHIVE_DIR),
+            f"{opaque_session_id(test_session)}.jsonl.enc",
+        )
         if os.path.exists(archive_path):
             print(f"\nSUCCESS: Archive file created successfully at {archive_path}")
             with open(archive_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-                print(f" - Contains {len(lines)} JSON lines.")
+                record = decrypt_session_content(lines[-1].strip())
+                print(f" - Contains {len(lines)} encrypted archive envelope(s).")
+                print(f" - Latest decrypted envelope length: {len(record)} characters.")
             # Cleanup archive
             os.remove(archive_path)
         else:

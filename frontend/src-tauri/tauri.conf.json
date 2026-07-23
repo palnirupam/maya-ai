@@ -3,10 +3,10 @@
   "version": "1.0.0",
   "identifier": "com.mayaai.app",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm --prefix .. run start:tauri-services",
     "beforeBuildCommand": "npm run build",
-    "devPath": "http://localhost:1420",
-    "distDir": "../dist"
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
   },
   "app": {
     "withGlobalTauri": true,
@@ -22,7 +22,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:8000 ws://127.0.0.1:8000; frame-src http://127.0.0.1:8000; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
     }
   }
 }

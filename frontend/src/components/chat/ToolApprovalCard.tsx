@@ -11,7 +11,7 @@ export const ToolApprovalCard: React.FC<Props> = ({ request }) => {
 
   const handleAction = (approved: boolean) => {
     // Send the resolution back to the backend
-    wsClient.send('tool_resolution', {
+    wsClient.send('tool_approval_response', {
       request_id: request.request_id,
       approved: approved
     });
@@ -19,8 +19,9 @@ export const ToolApprovalCard: React.FC<Props> = ({ request }) => {
     removeToolRequest(request.request_id);
   };
 
-  const riskColor = request.risk_level === 'high' ? 'bg-red-500/20 text-red-400 border-red-500' : 
-                    request.risk_level === 'warning' ? 'bg-yellow-500/20 text-yellow-400 border-yellow-500' :
+  const risk = request.risk_level.toUpperCase();
+  const riskColor = risk === 'CRITICAL' || risk === 'HIGH' ? 'bg-red-500/20 text-red-400 border-red-500' :
+                    risk === 'MEDIUM' || risk === 'WARNING' ? 'bg-yellow-500/20 text-yellow-400 border-yellow-500' :
                     'bg-cyan-500/20 text-cyan-400 border-cyan-500';
 
   return (

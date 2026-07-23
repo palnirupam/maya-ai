@@ -1,7 +1,9 @@
 """
 Maya AI — Contact Manager Tool
-Handles saving contacts to SQLite and looking them up with fuzzy matching.
+Handles saving contacts to SQLite and looking them up with fuzzy matching,
+falling back to the logged-in WhatsApp account's synced contacts.
 """
+import json
 import re
 import logging
 from rapidfuzz import process, fuzz
@@ -10,6 +12,11 @@ from backend.database.connection import SessionLocal
 from backend.database.models import Contact
 
 logger = logging.getLogger(__name__)
+
+# Bounded wait for the WhatsApp service before the synced-contacts fallback.
+# The send tools tolerate 90s, but a mere lookup should fail fast and honest
+# ("WhatsApp not connected") instead of hanging the whole agent turn.
+_WA_LOOKUP_WAIT_SECONDS = 20
 
 
 def _is_valid_phone(phone: str) -> bool:
@@ -123,9 +130,74 @@ def lookup_contact(name: str) -> dict:
         db.close()
 
 
+def _lookup_whatsapp_contact(name: str) -> str:
+    """Fallback when Maya's DB has no match: search the contacts synced from
+    the logged-in WhatsApp account — the same resolution whatsapp_send_message
+    uses — so a 'Pintu' who was never save_contact-ed is still findable.
+
+    Returns the same string protocol as get_contact_number (SUCCESS/ERROR),
+    plus CLARIFICATION_NEEDED:contact_pick when several contacts match
+    (agent_team relays that list to the user verbatim)."""
+    from backend.tools.desktop.advanced.whatsapp_manager import whatsapp_manager
+
+    try:
+        resolved = whatsapp_manager.resolve_contact(
+            name,
+            wait_timeout=_WA_LOOKUP_WAIT_SECONDS,
+        )
+    except Exception as e:
+        logger.error(f"WhatsApp synced-contact fallback failed for '{name}': {e}")
+        return f"ERROR: No contact found matching '{name}' in Maya's saved contacts."
+
+    error = resolved.get("error", "")
+    if not resolved.get("success"):
+        if "not connected" in error.lower():
+            return (
+                f"ERROR: '{name}' is not in Maya's saved contacts, and WhatsApp "
+                f"is not connected, so its synced contacts could not be searched. "
+                f"Ask the user for the phone number, or to pair WhatsApp first."
+            )
+        return (
+            f"ERROR: No contact found matching '{name}' — searched Maya's "
+            f"saved contacts and the WhatsApp synced contacts."
+        )
+
+    candidates = resolved.get("candidates") or []
+    if len(candidates) > 1:
+        payload = json.dumps(
+            {
+                "kind": "contact_pick",
+                "query": name,
+                "candidates": [
+                    {"name": c.get("name", "?"), "number": c.get("number", "?")}
+                    for c in candidates
+                ],
+            },
+            ensure_ascii=False,
+        )
+        return f"CLARIFICATION_NEEDED:{payload}"
+
+    best = candidates[0] if candidates else {
+        "name": resolved.get("name", name),
+        "number": resolved.get("phone"),
+    }
+    phone = best.get("number")
+    if not phone:
+        return (
+            f"ERROR: No contact found matching '{name}' — searched Maya's "
+            f"saved contacts and the WhatsApp synced contacts."
+        )
+    return (
+        f"SUCCESS: Found contact '{best.get('name', name)}' in the WhatsApp "
+        f"synced contacts with phone number: {phone}."
+    )
+
+
 def get_contact_number(name: str) -> str:
     """
-    Retrieves the phone number of a contact by name. Uses fuzzy search.
+    Retrieves the phone number of a contact by name. Uses fuzzy search over
+    Maya's saved contacts, then falls back to the logged-in WhatsApp
+    account's synced contacts.
     Args:
         name (str): The name of the contact to look up (e.g. 'Pintu').
     """
@@ -136,7 +208,7 @@ def get_contact_number(name: str) -> str:
             f"with phone number: {match['phone']} "
             f"(match score: {match['score']:.1f}%)."
         )
-    return f"ERROR: No contact found matching '{name}'."
+    return _lookup_whatsapp_contact(name)
 
 def delete_contact(name: str) -> str:
     """

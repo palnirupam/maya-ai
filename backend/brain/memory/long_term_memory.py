@@ -10,14 +10,17 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 def _get_embedding(text: str) -> list[float] | None:
-    """Generates embedding vector using gemini-embedding-2."""
+    """Generates embedding vector using the configured cloud embedding model."""
     try:
+        from ...config.model_config import get_model
         from ..providers.gemini_adapter import gemini_adapter
         if not gemini_adapter or not gemini_adapter.client:
-            logger.warning("Gemini adapter or client not available for embedding.")
+            logger.debug("Native Gemini client not available for embeddings; using keyword memory fallback.")
             return None
+
+        model_name = get_model("embedding_cloud")
         response = gemini_adapter.client.models.embed_content(
-            model='gemini-embedding-2',
+            model=model_name,
             contents=text
         )
         if hasattr(response, 'embeddings') and response.embeddings:
@@ -46,8 +49,9 @@ def store_memory(category: str, content: str, importance: int = 3, source_sessio
         try:
             vector_vals = _get_embedding(content)
             if vector_vals:
+                from ...config.model_config import get_model
                 vector_str = json.dumps(vector_vals)
-                embedding_model = 'gemini-embedding-2'
+                embedding_model = get_model("embedding_cloud")
         except Exception as embed_err:
             logger.warning(f"Non-blocking embedding failure in store_memory: {embed_err}")
 
@@ -105,24 +109,14 @@ def retrieve_relevant_memories(context_text: str = "", active_category: str = No
                     if mem.importance < 4:
                         continue
                 
-                # Check for legacy memories that need backfill
+                # Parse pre-computed vector embedding if present
                 mem_vector = None
-                if query_vector is not None:
-                    if not mem.vector or mem.embedding_model != 'gemini-embedding-2':
-                        if len(backfill_updates) < MAX_BACKFILL_PER_QUERY:
-                            logger.info(f"Backfilling vector on-the-fly for memory ID {mem.id}")
-                            new_vector_vals = _get_embedding(decrypted_content)
-                            if new_vector_vals:
-                                mem.vector = json.dumps(new_vector_vals)
-                                mem.embedding_model = 'gemini-embedding-2'
-                                backfill_updates.append(mem)
-                                mem_vector = new_vector_vals
-                    else:
-                        try:
-                            mem_vector = json.loads(mem.vector)
-                        except Exception as parse_err:
-                            logger.warning(f"Corrupted vector JSON for memory ID {mem.id}: {parse_err}")
-                            mem_vector = None
+                if query_vector is not None and mem.vector:
+                    try:
+                        mem_vector = json.loads(mem.vector)
+                    except Exception as parse_err:
+                        logger.warning(f"Corrupted vector JSON for memory ID {mem.id}: {parse_err}")
+                        mem_vector = None
                 
                 # If we successfully have both query and memory vectors, calculate cosine similarity
                 if query_vector is not None and mem_vector is not None:
@@ -155,12 +149,16 @@ def retrieve_relevant_memories(context_text: str = "", active_category: str = No
                         if score >= SIMILARITY_THRESHOLD or mem.importance == 5:
                             results_with_scores.append((score, decrypted_content, mem))
                 else:
-                    # Fallback keyword matching (or standard return all if query is empty)
+                    # Fallback keyword matching
                     if keywords:
                         content_lower = decrypted_content.lower()
                         if not any(k in content_lower for k in keywords):
                             if mem.importance < 5:
                                 continue
+                    elif context_text and len(context_text.strip()) > 0:
+                        # Short query without keywords/embedding (e.g. "hi") - do not pollute prompt
+                        continue
+
                     # Set a default dummy score based on importance for ranking fallbacks
                     score = 0.1 + (mem.importance * 0.05)
                     results_with_scores.append((score, decrypted_content, mem))

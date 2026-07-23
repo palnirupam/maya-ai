@@ -3,6 +3,8 @@ import re
 import edge_tts
 from typing import AsyncGenerator
 
+from ...brain.language_style import detect_language_style, tts_language_for_style
+
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -10,19 +12,8 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def detect_language(text: str) -> str:
-    if not text:
-        return "en"
-    bn = sum(1 for c in text if '\u0980' <= c <= '\u09FF')
-    hi = sum(1 for c in text if '\u0900' <= c <= '\u097F')
-    en = sum(1 for c in text if c.isascii() and c.isalpha())
-    total = bn + hi + en
-    if total == 0:
-        return "en"
-    if bn >= hi and bn >= en:
-        return "bn"
-    elif hi >= bn and hi >= en:
-        return "hi"
-    return "en"
+    """Choose a TTS voice for native-script or Latin-script conversation text."""
+    return tts_language_for_style(detect_language_style(text))
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -62,12 +62,15 @@ def configure_gmail_credentials(email: str, app_password: str) -> str:
         email (str): The Gmail address (e.g. user@gmail.com).
         app_password (str): The 16-letter App Password generated from Google settings (e.g. abcd efgh ijkl mnop).
     """
+    from backend.tools.desktop.advanced.email_security import validate_gmail_credentials
+
+    credentials, validation_error = validate_gmail_credentials(email, app_password)
+    if validation_error or credentials is None:
+        return f"ERROR: {validation_error}"
+    clean_email, clean_pass = credentials
+
     db = SessionLocal()
     try:
-        # Clean password (remove spaces) and email
-        clean_pass = app_password.replace(" ", "").lower().strip()
-        clean_email = email.lower().strip()
-        
         email_val = crypto_manager.encrypt(clean_email)
         pass_val = crypto_manager.encrypt(clean_pass)
         
@@ -86,9 +89,15 @@ def configure_gmail_credentials(email: str, app_password: str) -> str:
             db.add(UserPreferences(key="GMAIL_APP_PASSWORD", value=pass_val))
             
         db.commit()
-        return "SUCCESS: Gmail credentials securely configured. Maya can now send background emails!"
-    except Exception as e:
-        return f"ERROR: Failed to save credentials. {e}"
+        return "SUCCESS: Gmail credentials securely configured."
+    except Exception as exc:
+        db.rollback()
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Gmail credential save failed (%s).", type(exc).__name__
+        )
+        return "ERROR: Gmail credentials could not be saved."
     finally:
         db.close()
 

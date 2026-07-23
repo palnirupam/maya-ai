@@ -11,7 +11,23 @@ class KeyboardTools:
     @staticmethod
     def type_text(text: str):
         logger.info(f"Typing text: {text}")
-        pyautogui.write(text, interval=0.05)
+        # pyautogui.write() silently drops non-ASCII (Bengali etc.) and can
+        # garble text if focus shifts mid-typing. Clipboard-paste is instant
+        # and Unicode-safe; fall back to write() only for plain ASCII.
+        try:
+            import pyperclip
+            old_clip = None
+            try:
+                old_clip = pyperclip.paste()
+            except Exception:
+                pass
+            pyperclip.copy(text)
+            pyautogui.hotkey("ctrl", "v")
+            if old_clip is not None:
+                import threading
+                threading.Timer(1.0, lambda: pyperclip.copy(old_clip)).start()
+        except Exception:
+            pyautogui.write(text, interval=0.05)
         return f"Typed: '{text}'"
 
     @staticmethod

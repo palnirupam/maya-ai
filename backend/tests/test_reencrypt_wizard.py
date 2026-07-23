@@ -1,44 +1,32 @@
 import unittest
 import shutil
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
-DB_PATH = Path("data/memory.db")
-BACKUP_PATH = Path("data/memory.db.backup")
 
-def backup_database():
+def backup_database(db_path, backup_path):
     """Helper to backup database - used in test."""
-    if DB_PATH.exists():
-        shutil.copy2(DB_PATH, BACKUP_PATH)
+    if db_path.exists():
+        shutil.copy2(db_path, backup_path)
         return True
     return False
 
 class TestReencryptWizard(unittest.TestCase):
     def setUp(self):
-        if not DB_PATH.parent.exists():
-            DB_PATH.parent.mkdir(parents=True)
-        # Use the real DB if it exists, otherwise create dummy
-        if not DB_PATH.exists():
-            DB_PATH.write_bytes(b"dummy database content")
-            self.created_dummy = True
-        else:
-            self.created_dummy = False
+        self.temp_dir = TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "memory.db"
+        self.backup_path = Path(self.temp_dir.name) / "memory.db.backup"
+        self.db_path.write_bytes(b"dummy database content")
 
     def test_backup_database(self):
-        if BACKUP_PATH.exists():
-            BACKUP_PATH.unlink()
-
-        result = backup_database()
+        result = backup_database(self.db_path, self.backup_path)
 
         self.assertTrue(result)
-        self.assertTrue(BACKUP_PATH.exists())
-        self.assertEqual(BACKUP_PATH.read_bytes(), DB_PATH.read_bytes())
+        self.assertTrue(self.backup_path.exists())
+        self.assertEqual(self.backup_path.read_bytes(), self.db_path.read_bytes())
 
     def tearDown(self):
-        if hasattr(self, 'created_dummy') and self.created_dummy:
-            if DB_PATH.exists():
-                DB_PATH.unlink()
-        if BACKUP_PATH.exists():
-            BACKUP_PATH.unlink()
+        self.temp_dir.cleanup()
 
 if __name__ == "__main__":
     unittest.main()

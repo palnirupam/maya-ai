@@ -173,7 +173,9 @@ export const useVoiceSession = () => {
           isMayaSpeakingRef.current = false;
           _abortRecording();
           _setState('LISTENING');
-          _startRecorder();
+          // Do not start a recorder just because playback was interrupted.
+          // The normal VAD branch will start it only while speech is actually
+          // present, which avoids uploading Maya's speaker echo / trailing noise.
         }
         vadLoopRef.current = requestAnimationFrame(tick);
         return;
@@ -228,10 +230,9 @@ export const useVoiceSession = () => {
       if (!sessionActiveRef.current) return;
       isMayaSpeakingRef.current = false;
       _setState('LISTENING');
-      // Restart recorder so VAD loop can pick up next utterance
-      if (!isRecordingRef.current) {
-        _startRecorder();
-      }
+      // Stay armed but idle. The VAD loop starts MediaRecorder only after it
+      // detects the user's voice. Starting it here records pure silence and
+      // sends that silence 1.5s later, which can make STT invent a new turn.
     };
 
     const onError = () => {
@@ -253,7 +254,7 @@ export const useVoiceSession = () => {
       wsClient.off?.('audio_ended', onAudioEnded);
       wsClient.off?.('error', onError);
     };
-  }, [_setState, _startRecorder]);
+  }, [_setState]);
 
   // ── Public API ───────────────────────────────────────────────────────────────
 

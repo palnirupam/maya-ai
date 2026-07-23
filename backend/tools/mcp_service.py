@@ -99,12 +99,12 @@ class MCPServerBase:
             tools_response = await self.session.list_tools()
             self._tools = tools_response.tools if hasattr(tools_response, "tools") else []
             self.state = ServerState.READY
+            self.ready_event.set()
         except Exception as e:
+            self.ready_event.clear()
             logger.warning(f"MCP Server {self.name} failed to restart: {e}")
             self.state = ServerState.FAILED
             raise
-        finally:
-            self.ready_event.set()
 
     async def _perform_restart(self):
         raise NotImplementedError
@@ -333,24 +333,16 @@ class MCPService:
                 tools_to_add = tools_to_add[:available_for_server]
                 
             for t in tools_to_add:
-                # Convert MCP Tool to Gemini FunctionDeclaration-like dict
-                from google.genai import types
-                
-                # Sanitize schema for Gemini (it rejects $schema and sometimes other fields)
+                # Keep discovery provider-neutral. The active LLM adapter
+                # converts this schema to Gemini/OpenAI/Anthropic format later.
                 safe_schema = t.inputSchema.copy() if t.inputSchema else {}
                 safe_schema.pop("$schema", None)
-                
-                final_tools.append(
-                    types.Tool(
-                        function_declarations=[
-                            types.FunctionDeclaration(
-                                name=f"{st['server_name']}__{t.name}",
-                                description=t.description or f"Tool {t.name} from {st['server_name']}",
-                                parameters=safe_schema
-                            )
-                        ]
-                    )
-                )
+
+                final_tools.append({
+                    "name": f"{st['server_name']}__{t.name}",
+                    "description": t.description or f"Tool {t.name} from {st['server_name']}",
+                    "parameters": safe_schema,
+                })
                 
         return final_tools
 
@@ -367,7 +359,7 @@ class MCPService:
         
         # Result format handling for Gemini
         if hasattr(result, "content") and result.content:
-            return "\\n".join([c.text for c in result.content if hasattr(c, "text")])
+            return "\n".join([c.text for c in result.content if hasattr(c, "text")])
         return "Success"
 
 mcp_service = MCPService()

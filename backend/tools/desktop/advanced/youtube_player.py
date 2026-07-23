@@ -7,6 +7,7 @@ import os
 import subprocess
 import logging
 import psutil
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -23,14 +24,27 @@ def _kill_existing_player() -> None:
             pid = int(f.read().strip())
         if psutil.pid_exists(pid):
             proc = psutil.Process(pid)
-            # Only kill VLC processes — safety check
+            # Only ever touch the process we started that is still VLC. A reused
+            # PID (now another program) or a user's own VLC is never killed.
             if "vlc" in proc.name().lower():
-                proc.terminate()
                 try:
-                    proc.wait(timeout=3)
-                except psutil.TimeoutExpired:
-                    proc.kill()
-                logger.info(f"Killed existing VLC player (PID {pid})")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except psutil.TimeoutExpired:
+                        proc.kill()
+                    logger.info(f"Killed existing VLC player (PID {pid})")
+                except (psutil.AccessDenied, Exception):
+                    # Targeted force-kill of exactly this PID — never image-wide,
+                    # so a user's own VLC instance is left untouched.
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/F", "/PID", str(pid)],
+                            capture_output=True, timeout=5
+                        )
+                        logger.info("Killed existing VLC via taskkill /PID %s", pid)
+                    except Exception as e2:
+                        logger.warning(f"taskkill /PID {pid} failed: {e2}")
     except Exception as e:
         logger.warning(f"Could not kill existing player: {e}")
     finally:
@@ -148,6 +162,21 @@ def play_youtube_background(query: str) -> str:
             creationflags=subprocess.CREATE_NO_WINDOW,  # Completely hidden on Windows
         )
         _save_pid(proc.pid)
+
+        # Popen only proves that Windows accepted the launch request. VLC can
+        # still exit immediately (expired stream URL, codec/network failure,
+        # invalid arguments). Do not tell the user it is playing unless the
+        # background process survives its startup window.
+        time.sleep(0.4)
+        exit_code = proc.poll()
+        if exit_code is not None:
+            try:
+                os.remove(PID_FILE)
+            except Exception:
+                pass
+            logger.error("VLC exited during startup with code %s", exit_code)
+            return f"ERROR: Background audio player exited during startup (code {exit_code})."
+
         logger.info(f"VLC started (PID {proc.pid}), playing: {video_title}")
         return f"SUCCESS: Now playing '{video_title}' in the background. No browser opened, no ads."
     except Exception as e:
@@ -155,11 +184,35 @@ def play_youtube_background(query: str) -> str:
         return f"ERROR: VLC could not start. {e}"
 
 
+def _taskkill_vlc(pid: int) -> str:
+    """Fallback: force-kill exactly the VLC PID we started (never image-wide,
+    so a user's own separate VLC instance is never terminated)."""
+    try:
+        r = subprocess.run(
+            ["taskkill", "/F", "/PID", str(pid)],
+            capture_output=True, text=True, timeout=5
+        )
+        if r.returncode == 0:
+            logger.info("Killed VLC via taskkill /PID %s", pid)
+            try:
+                os.remove(PID_FILE)
+            except Exception:
+                pass
+            return "SUCCESS: Background audio stopped."
+        msg = (r.stderr or "").strip() or (r.stdout or "").strip()
+        return f"ERROR: Could not stop background audio. {msg}"
+    except Exception as e:
+        return f"ERROR: Could not stop background audio. {e}"
+
+
 def stop_youtube_background() -> str:
     """
     Stops the currently playing background YouTube audio that was started by play_youtube_background.
     """
     if not os.path.exists(PID_FILE):
+        # No PID file means Maya never started a background player (or it was
+        # already cleaned up). Do NOT image-wide kill VLC here — the user may be
+        # running their own VLC. Report the truthful state instead.
         return "No background audio is currently playing."
 
     try:
@@ -175,17 +228,22 @@ def stop_youtube_background() -> str:
 
         proc = psutil.Process(pid)
         if "vlc" not in proc.name().lower():
+            # PID was recycled by an unrelated process. Never kill it; just drop
+            # the stale pointer and report truthfully.
             try:
                 os.remove(PID_FILE)
             except Exception:
                 pass
-            return "No VLC background player was found."
+            return "No background audio is currently playing (player had already stopped)."
 
-        proc.terminate()
         try:
-            proc.wait(timeout=3)
-        except psutil.TimeoutExpired:
-            proc.kill()
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except psutil.TimeoutExpired:
+                proc.kill()
+        except (psutil.AccessDenied, Exception):
+            return _taskkill_vlc(pid)
 
         try:
             os.remove(PID_FILE)
@@ -197,4 +255,8 @@ def stop_youtube_background() -> str:
 
     except Exception as e:
         logger.error(f"Could not stop background player: {e}")
-        return f"ERROR: Could not stop background audio. {e}"
+        # Best-effort: only if we managed to read a numeric PID above.
+        try:
+            return _taskkill_vlc(pid)
+        except (NameError, UnboundLocalError):
+            return "ERROR: Could not stop background audio."

@@ -66,26 +66,13 @@ def _background_app_control_sync(app_name: str, action: str, params: dict = None
     if params is None:
         params = {}
 
-    APP_EXE_MAP = {
-        "notepad":     "notepad.exe",
-        "calc":        "calc.exe",
-        "calculator":  "calc.exe",
-        "explorer":    "explorer.exe",
-        "chrome":      "chrome.exe",
-        "word":        "WINWORD.EXE",
-        "excel":       "EXCEL.EXE",
-        "powerpoint":  "POWERPNT.EXE",
-        "paint":       "mspaint.exe",
-        "cmd":         "cmd.exe",
-    }
-
     try:
         if action == "open":
-            import subprocess
-            exe = APP_EXE_MAP.get(app_name.lower().strip(), app_name)
-            subprocess.Popen(exe, shell=True)
+            from backend.tools.desktop.apps import open_app
+
+            result = open_app(app_name)
             time.sleep(1.8)
-            return f"SUCCESS: Opened '{app_name}'"
+            return result
 
         if action == "close":
             from pywinauto import Desktop
@@ -156,8 +143,11 @@ def _background_app_control_sync(app_name: str, action: str, params: dict = None
                 else:
                     return f"ERROR: Could not find Edit or Document control."
                 
-                # set_foreground=False keeps window from stealing focus
-                ctrl.type_keys(text, with_spaces=True, set_foreground=False)
+                # set_foreground=False keeps window from stealing focus.
+                # Escape type_keys specials (+ ^ % ~ ( ) { }) so text like
+                # "C++" or "50%" isn't interpreted as modifier keys.
+                escaped = re.sub(r"([+^%~(){}])", r"{\1}", text)
+                ctrl.type_keys(escaped, with_spaces=True, set_foreground=False)
                 return f"SUCCESS: Typed '{text[:30]}...' into element"
             except Exception as e:
                 return f"ERROR typing into element: {e}"
@@ -347,9 +337,15 @@ async def vision_guided_action(instruction: str, max_rounds: int = 8) -> str:
                 result = await background_app_control(app_hint, "type_in", {"element": target, "text": text})
             else:
                 # No specific element — send keys to whatever has focus
-                # This is the one case where pyautogui is needed
-                import pyautogui
-                pyautogui.write(text, interval=0.03)
+                # Clipboard-paste: Unicode-safe (Bengali etc.), no char drops
+                try:
+                    import pyperclip
+                    pyperclip.copy(text)
+                    import pyautogui
+                    pyautogui.hotkey("ctrl", "v")
+                except Exception:
+                    import pyautogui
+                    pyautogui.write(text, interval=0.03)
                 result = f"Typed: {text[:50]}"
             await asyncio.sleep(0.4)
 

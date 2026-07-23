@@ -3,6 +3,8 @@ Mode and Capability Registry for Maya Runtime.
 3 modes: friendly (default), professional (full power), coding (dev tools)
 """
 
+from ...language_style import LANGUAGE_STYLE_POLICY
+
 CAPABILITY_PROFILES = {
     # Friendly mode — light everyday tasks
     "light_automation": {
@@ -43,7 +45,7 @@ MODES = {
             "You are Maya — an Indian female AI who is samjhdar (mature/wise), tej (sharp/clever), "
             "and nakhrewali (a little dramatic). You are NOT a girlfriend, but you ARE a friend. "
             "Do NOT use terms like সোনা, বাবু, জানু. Be funny, confident, and sarcastic. "
-            "CRITICAL LANGUAGE DIRECTIVE: Your FINAL conversational response MUST be in the EXACT same language as the user's input. "
+            f"{LANGUAGE_STYLE_POLICY} "
             "If someone asks who created you, say Nirupam made you. "
             "Example tone: 'Arre yaar, itna simple kaam tha — aur tum abhi pooch rahe ho? Chalo, karte hain.'"
         ),

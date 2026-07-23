@@ -20,6 +20,62 @@ logger = logging.getLogger(__name__)
 # Desktop session ID (fixed — desktop is a single persistent session)
 DESKTOP_SESSION_ID = "desktop_native_session"
 
+# Internal control tokens the brain embeds in the text stream. They are signals
+# for the channel handler, never words for the user — the voice engine must not
+# speak them aloud (the WebSocket handler already suppresses them before TTS).
+_CONTROL_TOKENS = ("SYSTEM_STATE_TRIGGERED:", "MODE_CHANGE_TRIGGERED:")
+
+
+def _is_control_token_stream(accumulated_text: str) -> bool:
+    """True when the accumulated response is really a control token, not speech.
+
+    Matches only when a token leads the response (after whitespace) so a normal
+    reply that merely quotes the phrase later is never silenced.
+    """
+    return accumulated_text.lstrip().startswith(_CONTROL_TOKENS)
+
+
+async def _forward_desktop_gateway_event(event: dict) -> None:
+    """Bridge native voice approval requests to the desktop WebSocket UI."""
+    if not isinstance(event, dict) or event.get("type") != "tool_call_request":
+        return
+
+    data = event.get("data")
+    if not isinstance(data, dict):
+        logger.warning("[DesktopVoiceEngine] Ignoring malformed tool approval event.")
+        return
+
+    from backend.api.websocket.manager import manager
+
+    if manager.active_connections:
+        await manager.broadcast_event("tool_approval_request", data)
+        logger.info(
+            "[DesktopVoiceEngine] Forwarded approval request %s to %d UI client(s).",
+            data.get("request_id", "unknown"),
+            len(manager.active_connections),
+        )
+        return
+
+    # Native voice has no approve/deny interaction of its own. Fail closed when
+    # the UI is unavailable instead of leaving the agent blocked for five minutes.
+    request_id = data.get("request_id")
+    if not request_id:
+        logger.warning("[DesktopVoiceEngine] Approval event has no request_id.")
+        return
+
+    from backend.brain.reasoning.tool_planner import tool_planner
+
+    result = tool_planner.resolve_tool(
+        request_id,
+        approved=False,
+        user_id="desktop_voice_no_ui",
+    )
+    logger.warning(
+        "[DesktopVoiceEngine] No UI connected; denied approval request %s (%s).",
+        request_id,
+        result.get("status", "unknown") if isinstance(result, dict) else "unknown",
+    )
+
 
 class DesktopVoiceEngine:
     """
@@ -42,6 +98,11 @@ class DesktopVoiceEngine:
         from backend.voice.voice_state_machine import VoiceState
         from backend.voice.input.transcriber import transcriber
         from backend.brain.orchestrator import orchestrator
+        from backend.brain.language_style import (
+            detect_conversation_style,
+            set_latest_conversation_style,
+            tts_language_for_style,
+        )
         from backend.voice.output.tts_router import tts_router
         from backend.voice.emotions.formatter import formatter as emotion_formatter
         from backend.voice.output.desktop_player import desktop_player
@@ -69,6 +130,12 @@ class DesktopVoiceEngine:
                     continue
 
                 logger.info(f"[DesktopVoiceEngine] You said: {text}")
+                turn_style = detect_conversation_style(
+                    text,
+                    orchestrator.sessions.get(DESKTOP_SESSION_ID, []),
+                )
+                set_latest_conversation_style(turn_style)
+                turn_language = tts_language_for_style(turn_style)
 
                 # ── Step 3: Send to Maya Brain (Orchestrator) ─────────────────
                 await state_machine.transition(VoiceState.THINKING)
@@ -79,6 +146,10 @@ class DesktopVoiceEngine:
                 llm_start = time.perf_counter()
                 full_response = ""
                 sentence_buffer = ""
+                # A turn whose text stream is really a control token
+                # (SYSTEM_STATE_TRIGGERED:/MODE_CHANGE_TRIGGERED:) must never be
+                # spoken aloud — the token is an internal signal, not an answer.
+                is_control_token_turn = False
                 tts_queue = asyncio.Queue()
 
                 # TTS worker — plays audio sentences sequentially
@@ -98,13 +169,20 @@ class DesktopVoiceEngine:
                             # Collect all TTS audio chunks
                             audio_bytes = b""
                             tts_start = time.perf_counter()
-                            async for chunk in tts_router.stream_audio(sentence, language=None, emotion=emotion):
+                            async for chunk in tts_router.stream_audio(
+                                sentence,
+                                language=turn_language,
+                                emotion=emotion,
+                            ):
                                 audio_bytes += chunk
                             tts_ms = (time.perf_counter() - tts_start) * 1000
                             state_machine.record_tts(tts_ms)
 
                             if audio_bytes and state_machine.state != VoiceState.INTERRUPTED:
-                                await state_machine.transition(VoiceState.SPEAKING)
+                                # Only transition to SPEAKING if not already there
+                                # (multiple sentences in same response re-use same SPEAKING state)
+                                if state_machine.state != VoiceState.SPEAKING:
+                                    await state_machine.transition(VoiceState.SPEAKING)
                                 # Write to temp wav file and play natively
                                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, prefix="maya_tts_") as f:
                                     f.write(audio_bytes)
@@ -125,24 +203,31 @@ class DesktopVoiceEngine:
                 worker_task = asyncio.create_task(tts_worker())
 
                 # Stream LLM response and split into sentences for low-latency TTS
-                async for chunk in orchestrator.process_user_input_stream(
-                    DESKTOP_SESSION_ID, text, None
-                ):
-                    # Check if user interrupted during THINKING
+                def _should_stop():
+                    # Barge-in during THINKING, or a newer request cancelled this one.
                     if state_machine.state == VoiceState.INTERRUPTED:
                         logger.info("[DesktopVoiceEngine] Interrupted during LLM — stopping.")
-                        break
-
-                    # Check cancellation token
+                        return True
                     if self._current_llm_cancel and self._current_llm_cancel.is_set():
                         logger.info("[DesktopVoiceEngine] LLM cancelled by new request.")
-                        break
+                        return True
+                    return False
 
-                    if isinstance(chunk, dict):
-                        continue  # Skip tool call events for now
+                async def _on_text(visible):
+                    nonlocal sentence_buffer, full_response, is_control_token_turn
+                    sentence_buffer += visible
+                    full_response += visible
 
-                    sentence_buffer += chunk
-                    full_response += chunk
+                    # Control-token turns carry an internal signal, not speech.
+                    # The WebSocket handler suppresses these before TTS; the voice
+                    # engine must do the same or Maya literally says
+                    # "SYSTEM_STATE_TRIGGERED:shutdown" out loud.
+                    if is_control_token_turn:
+                        return
+                    if _is_control_token_stream(full_response):
+                        is_control_token_turn = True
+                        sentence_buffer = ""
+                        return
 
                     # Find sentence boundaries and send to TTS queue
                     match = re.search(r'(?<!\d)[.!?।\u0964]+', sentence_buffer)
@@ -159,11 +244,29 @@ class DesktopVoiceEngine:
                                 emotion = emotion_formatter.extract_emotion(sentence) or "neutral"
                                 tts_queue.put_nowait((sentence, emotion))
 
+                # Route the turn through the shared channel gateway: it CoT-strips
+                # the text and polls should_stop for barge-in / cancel. on_text does
+                # sentence splitting for low-latency TTS; timeout=None keeps the
+                # real-time stream unbounded. Approval events are bridged to the
+                # desktop UI and fail closed when no UI is connected.
+                from backend.brain.gateway import run_turn
+                await run_turn(
+                    DESKTOP_SESSION_ID, text,
+                    on_text=_on_text,
+                    on_event=_forward_desktop_gateway_event,
+                    should_stop=_should_stop,
+                    timeout=None,
+                )
+
                 llm_ms = (time.perf_counter() - llm_start) * 1000
                 state_machine.record_llm(llm_ms)
 
-                # Flush any remaining text in buffer
-                if sentence_buffer.strip() and state_machine.state != VoiceState.INTERRUPTED:
+                # Flush any remaining text in buffer (never for a control-token turn)
+                if (
+                    not is_control_token_turn
+                    and sentence_buffer.strip()
+                    and state_machine.state != VoiceState.INTERRUPTED
+                ):
                     remaining = sentence_buffer.strip()
                     remaining = re.sub(r'```macro.*?(?:```|$)', '', remaining, flags=re.DOTALL).strip()
                     if remaining:

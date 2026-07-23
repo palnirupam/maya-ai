@@ -292,22 +292,167 @@ def control_display(action: str) -> str:
         return f"ERROR: Could not change display mode. {e}"
 
 
-def manage_window(action: str) -> str:
+def _snap_window_direct(action_lower: str, window_title: str = None) -> str:
     """
-    Manages the currently active window — maximize, minimize, restore, close, or move to a side.
+    Snap a window to the left/right half of its monitor using the Win32 API.
+
+    Reliable where the Win+Left/Win+Right hotkeys are not: it moves an exact
+    target window (found by title) without relying on focus stealing, so it
+    works even when the window is not currently active.
+    """
+    import win32gui, win32con, win32api
+    import pygetwindow as gw
+
+    # ── Locate the target window ──────────────────────────────────────────────
+    if window_title:
+        matches = [
+            w for w in gw.getAllWindows()
+            if (w.title or "").strip() and window_title.lower() in w.title.lower()
+        ]
+        if not matches:
+            return f"ERROR: No open window matching '{window_title}' found."
+        hwnd = matches[0]._hWnd
+    else:
+        hwnd = win32gui.GetForegroundWindow()
+    if not hwnd:
+        return "ERROR: No target window found to snap."
+
+    # Un-maximize first, otherwise MoveWindow is ignored on a maximized window.
+    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+
+    # Work area of the monitor the window lives on (excludes the taskbar).
+    monitor = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
+    left, top, right, bottom = win32api.GetMonitorInfo(monitor)["Work"]
+    width, height = right - left, bottom - top
+    half = width // 2
+
+    if action_lower == "snap_left":
+        x, y, w, h = left, top, half, height
+    else:  # snap_right
+        x, y, w, h = left + half, top, width - half, height
+
+    win32gui.MoveWindow(hwnd, x, y, w, h, True)
+    try:
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:
+        pass  # positioning already succeeded; focus is best-effort
+
+    title = (win32gui.GetWindowText(hwnd) or window_title or "")[:40]
+    side = "left" if action_lower == "snap_left" else "right"
+    return f"SUCCESS: Snapped '{title}' to the {side} half."
+
+
+def manage_window(action: str, window_title: str = None) -> str:
+    """
+    Manages a window: maximize, minimize, restore, close, snap_left, snap_right.
+    Fast and reliable: uses the direct Windows API (no focus-stealing hotkeys)
+    and can target a specific window by title.
     Args:
         action (str): One of:
-            'maximize'  — Make the current window full screen
-            'minimize'  — Minimize the current window to taskbar
-            'restore'   — Restore the current window to normal size
-            'close'     — Close the current window
-            'snap_left' — Snap the current window to the left half of the screen
-            'snap_right' — Snap the current window to the right half of the screen
+            'maximize'    — Make the window full screen
+            'minimize'    — Minimize the window to the taskbar
+            'restore'     — Restore the window to its normal size
+            'close'       — Close the window
+            'snap_left'   — Snap the window to the left half of the screen
+            'snap_right'  — Snap the window to the right half of the screen
+        window_title (str, optional): Target a window whose title contains this
+            text (e.g. 'Chrome', 'Notepad'). Defaults to the currently active window.
     """
-    import pyautogui
-
     action_lower = action.strip().lower()
-    action_map = {
+    valid = {"maximize", "minimize", "restore", "close", "snap_left", "snap_right"}
+    if action_lower not in valid:
+        return (f"ERROR: Unknown window action '{action}'. "
+                f"Use: maximize, minimize, restore, close, snap_left, snap_right.")
+
+    # ── Snapping: direct Win32 positioning (reliable, targets a specific ──────
+    # window, never steals focus from the wrong one or triggers Snap Assist).
+    if action_lower in ("snap_left", "snap_right"):
+        try:
+            return _snap_window_direct(action_lower, window_title)
+        except Exception as e:
+            logger.debug(f"[manage_window] direct snap failed, falling back to hotkey: {e}")
+
+    # ── Fast path: direct window API (pygetwindow / win32) ────────────────────
+    direct_error = None
+    if action_lower not in ("snap_left", "snap_right"):
+        try:
+            import pygetwindow as gw
+            win = None
+            if window_title:
+                matches = [
+                    w for w in gw.getAllWindows()
+                    if (w.title or "").strip() and window_title.lower() in w.title.lower()
+                ]
+                if not matches:
+                    return f"ERROR: No open window matching '{window_title}' found."
+                win = matches[0]
+            else:
+                win = gw.getActiveWindow()
+
+            if win is not None:
+                label = (win.title or "")[:40]
+                if action_lower == "close":
+                    from .apps import _wait_for_matching_windows, _window_is_protected_runtime
+
+                    if _window_is_protected_runtime(win):
+                        return (
+                            f"ERROR: Window '{label}' is protected and cannot be closed."
+                        )
+                # Bring a titled target to the foreground first (best-effort).
+                if window_title:
+                    try:
+                        win.activate()
+                    except Exception:
+                        pass
+                if action_lower == "maximize":
+                    win.maximize()
+                elif action_lower == "minimize":
+                    win.minimize()
+                elif action_lower == "restore":
+                    win.restore()
+                elif action_lower == "close":
+                    target_hwnd = getattr(win, "_hWnd", None)
+                    win.close()
+                    try:
+                        remaining = _wait_for_matching_windows(
+                            gw,
+                            lambda item: (
+                                getattr(item, "_hWnd", None) == target_hwnd
+                                if target_hwnd is not None
+                                else (getattr(item, "title", "") or "")[:40] == label
+                            ),
+                        )
+                    except Exception as verify_error:
+                        logger.debug(
+                            "[manage_window] close verification failed: %s",
+                            verify_error,
+                        )
+                        return (
+                            f"PARTIAL: Requested close for window '{label}', "
+                            "but completion could not be verified."
+                        )
+                    if remaining:
+                        return (
+                            f"PARTIAL: Requested close for window '{label}', "
+                            "but it remains open."
+                        )
+                    return f"SUCCESS: Closed window '{label}'."
+                return f"SUCCESS: Window '{action}' performed on '{label}'."
+            if action_lower == "close":
+                return "ERROR: No active window found."
+        except Exception as e:
+            direct_error = e
+            logger.debug(f"[manage_window] direct API failed, falling back to hotkey: {e}")
+
+    # Closing with Alt+F4 after inspection failed could terminate Maya itself.
+    # Fail closed; only non-destructive window actions may use the hotkey path.
+    if action_lower == "close":
+        detail = f" {direct_error}" if direct_error else ""
+        return f"ERROR: Could not safely inspect and close the target window.{detail}"
+
+    # ── Fallback path: keyboard hotkeys (also handles snapping) ───────────────
+    import pyautogui
+    hotkey_map = {
         "maximize":   ("win", "up"),
         "minimize":   ("win", "down"),
         "restore":    ("win", "down"),
@@ -315,13 +460,34 @@ def manage_window(action: str) -> str:
         "snap_left":  ("win", "left"),
         "snap_right": ("win", "right"),
     }
-
-    if action_lower not in action_map:
-        return f"ERROR: Unknown window action '{action}'. Use: maximize, minimize, restore, close, snap_left, snap_right."
-
     try:
+        # If a specific window was requested, focus it first.
+        if window_title:
+            try:
+                import pygetwindow as gw
+                matches = [
+                    w for w in gw.getAllWindows()
+                    if (w.title or "").strip() and window_title.lower() in w.title.lower()
+                ]
+                if matches:
+                    matches[0].activate()
+                    time.sleep(0.15)
+            except Exception:
+                pass
         time.sleep(0.1)
-        pyautogui.hotkey(*action_map[action_lower])
+        pyautogui.hotkey(*hotkey_map[action_lower])
         return f"SUCCESS: Window '{action}' performed."
     except Exception as e:
         return f"ERROR: Could not perform window action '{action}'. {e}"
+
+
+def snap_window(direction: str, window_title: str = None) -> str:
+    """
+    Snaps the active (or specified) window to one half of the screen.
+
+    Args:
+        direction (str): Either 'left' or 'right'.
+        window_title (str, optional): Title substring to find the window.
+    """
+    action = "snap_left" if direction.strip().lower() == "left" else "snap_right"
+    return manage_window(action=action, window_title=window_title)

@@ -29,7 +29,11 @@ def print_all_memories_db():
             cat = crypto_manager.decrypt(m.category)
             content = crypto_manager.decrypt(m.content)
             has_vector = m.vector is not None
-            vector_len = len(eval(m.vector)) if m.vector else 0
+            try:
+                import json as _json
+                vector_len = len(_json.loads(m.vector)) if m.vector else 0
+            except (ValueError, TypeError):
+                vector_len = 0
             print(f"ID: {m.id} | Cat: {cat} | Content: '{content}' | Importance: {m.importance} | Has Vector: {has_vector} (len={vector_len}) | Model: {m.embedding_model} | Accesses: {m.retrieval_count}")
         print("--------------------------------------------------\n")
     finally:

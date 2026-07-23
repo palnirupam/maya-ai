@@ -1,5 +1,17 @@
 import { useAssistantStore } from '../store/assistantStore';
 import { useEmotionStore } from '../store/emotionStore';
+import { useCanvasStore } from '../store/canvasStore';
+
+const env = (import.meta as ImportMeta & { env?: Record<string, string> }).env || {};
+
+export const backendHttpUrl = (
+  env.VITE_BACKEND_HTTP_URL || 'http://127.0.0.1:8000'
+).replace(/\/$/, '');
+
+const backendWsUrl =
+  env.VITE_BACKEND_WS_URL || backendHttpUrl.replace(/^http/, 'ws') + '/ws';
+
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 class AudioQueue {
   private queue: string[] = [];
@@ -109,13 +121,17 @@ class AudioQueue {
 class WebSocketClient {
   private ws: WebSocket | null = null;
   private url: string;
+  private healthUrl: string;
+  private connecting = false;
+  private shouldConnect = false;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
   private audioQueue = new AudioQueue();
   private listeners: Map<string, Set<(payload: any) => void>> = new Map();
 
-  constructor(url: string) {
+  constructor(url: string, healthUrl: string) {
     this.url = url;
+    this.healthUrl = healthUrl;
     this.audioQueue.onQueueEmpty = () => {
       this.emit('audio_ended', {});
     };
@@ -140,7 +156,18 @@ class WebSocketClient {
     }
   }
 
-  connect() {
+  async connect() {
+    this.shouldConnect = true;
+    if (this.connecting) return;
+    this.connecting = true;
+    const backendReady = await this.waitForBackend();
+    this.connecting = false;
+    if (!this.shouldConnect) return;
+    if (!backendReady) {
+      this.attemptReconnect();
+      return;
+    }
+
     if (this.ws) {
       this.ws.onclose = null;
       this.ws.close();
@@ -166,8 +193,23 @@ class WebSocketClient {
     this.ws.onclose = () => {
       console.log("WebSocket Disconnected");
       useAssistantStore.getState().setConnected(false);
-      this.attemptReconnect();
+      if (this.shouldConnect) {
+        this.attemptReconnect();
+      }
     };
+  }
+
+  private async waitForBackend() {
+    for (let attempt = 0; attempt < 60; attempt++) {
+      try {
+        const response = await fetch(`${this.healthUrl}/`, { cache: 'no-store' });
+        if (response.ok) return true;
+      } catch {
+        // Backend is still loading voice/Telegram services.
+      }
+      await delay(1000);
+    }
+    return false;
   }
 
   private attemptReconnect() {
@@ -205,21 +247,28 @@ class WebSocketClient {
           useEmotionStore.getState().setEmotion(payload.emotion);
         }
         break;
+      case 'tool_approval_request':
+        store.addToolRequest(payload);
+        break;
       case 'app_shutdown':
         console.log("Shutting down app natively...");
-        try {
-          if ((window as any).__TAURI__) {
-            (window as any).__TAURI__.window.appWindow.close();
-          } else {
-            window.close();
-          }
-        } catch(e) {
-          console.error("Failed to close window natively", e);
+        if ((window as any).__TAURI_INTERNALS__) {
+          void import('@tauri-apps/api/window')
+            .then(({ getCurrentWindow }) => getCurrentWindow().close())
+            .catch((error) => console.error("Failed to close Tauri window", error));
+        } else {
+          window.close();
         }
         break;
       case 'mode_changed':
         console.log("Mode changed natively:", payload.mode);
         store.setActiveTheme(payload.theme);
+        break;
+      case 'canvas_update':
+        // Open canvas panel for ANY session that triggered an update
+        // (Telegram, desktop, voice — all should show on the frontend)
+        console.log("Canvas updated for session:", payload.session_id);
+        useCanvasStore.getState().triggerUpdate(payload.session_id);
         break;
     }
   }
@@ -237,6 +286,7 @@ class WebSocketClient {
 
 
   disconnect() {
+    this.shouldConnect = false;
     if (this.ws) {
       this.ws.onclose = null;
       this.ws.close();
@@ -246,4 +296,4 @@ class WebSocketClient {
   }
 }
 
-export const wsClient = new WebSocketClient('ws://127.0.0.1:8000/ws');
+export const wsClient = new WebSocketClient(backendWsUrl, backendHttpUrl);

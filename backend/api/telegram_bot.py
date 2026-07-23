@@ -27,11 +27,12 @@ Improvements over previous version
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import io
 import json
 import logging
 import os
-import os
+import re
 import secrets
 import subprocess
 import time
@@ -40,11 +41,19 @@ from typing import Callable, Coroutine, Dict, Optional
 
 import httpx
 
-from backend.brain.orchestrator import orchestrator
 from backend.database.connection import SessionLocal
 from backend.database.crypto import crypto_manager
 from backend.database.models import UserPreferences
 from backend.brain.reasoning.tool_planner import tool_planner
+from backend.brain.language_style import (
+    BANGLISH,
+    ENGLISH,
+    HINDILISH,
+    detect_language_style,
+    get_latest_conversation_style,
+    response_style_directive,
+    set_latest_conversation_style,
+)
 from backend.system.process_manager import process_manager
 from backend.vision.capture.screen_capture import screen_capture
 
@@ -57,8 +66,10 @@ logger = logging.getLogger(__name__)
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 
 EDIT_INTERVAL   = 1.2    # seconds between live-edits (avoid Telegram flood)
-STREAM_TIMEOUT  = 120.0  # hard timeout for orchestrator stream
-MANUAL_TIMEOUT  = 300.0  # 5 min — auto-cancel WA manual reply
+STREAM_TIMEOUT  = 60.0   # soft deadline before the task continues in background
+BACKGROUND_TASK_TIMEOUT = 900.0  # hard ceiling for one Telegram task
+TASK_STATUS_TTL = 900.0  # keep a backgrounded task's final status for 15 min
+MANUAL_TIMEOUT  = 300.0  # 5 min - auto-cancel WA manual reply
 WA_EXPIRE_SECS  = 1800   # 30 min — remove stale pending WA replies
 WA_CLEANUP_INT  = 300    # check every 5 min
 MAX_EDIT_RETRIES = 3
@@ -78,6 +89,23 @@ STOP_KEYWORDS = frozenset([
     "stop", "halt", "panic", "🛑 emergency stop",
     "thamo", "থামো", "থাম",
 ])
+APPROVAL_YES = frozenset({"yes", "y", "yeah", "yep", "হ্যাঁ", "হ্যা", "হা", "জি", "করো", "execute"})
+APPROVAL_NO = frozenset({"no", "n", "nope", "না", "cancel", "বাতিল", "করো না"})
+
+_TASK_STATUS_RE = re.compile(
+    r"(?:/task_status|/status|task status|job status|status(?: ki| dao| bolo)?"
+    r"|progress(?: update| ki)?|update(?: dao| bolo)?)"
+    r"|(?:ki holo|ki obostha|koto dur|hoyeche|complete hoyeche|done hoyeche)"
+    r"|(?:(?:kaj|kaaj|task|job|eta|ota|pdf|email|mail)(?:\s*ta)?)"
+    r"\s+(?:ki\s+)?(?:holo|hoyeche|complete|done|status|progress)",
+    re.IGNORECASE,
+)
+
+
+def _is_task_status_request(text: str) -> bool:
+    """Return True only for short messages asking about the current task."""
+    normalized = re.sub(r"\s+", " ", (text or "").strip()).strip(" ?!.,")
+    return len(normalized) <= 100 and bool(_TASK_STATUS_RE.fullmatch(normalized))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Typed state containers (replaces raw dicts)
@@ -106,6 +134,21 @@ class PendingDangerousCmd:
     original_text: str
 
 
+@dataclass
+class TelegramTaskState:
+    """Progress snapshot for the latest orchestrator task in one chat."""
+    original_text: str
+    session_id: str
+    started_at: float = field(default_factory=time.monotonic)
+    updated_at: float = field(default_factory=time.monotonic)
+    state: str = "running"
+    active_agent: str = ""
+    status: str = "Starting task..."
+    backgrounded: bool = False
+    final_text: str = ""
+    error: str = ""
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main class
 # ──────────────────────────────────────────────────────────────────────────────
@@ -126,12 +169,22 @@ class TelegramBotManager:
 
         # Per-chat active task (for emergency stop)
         self._active_tasks: Dict[str, asyncio.Task] = {}
+        # Latest task snapshot. Backgrounded results remain queryable briefly
+        # after completion so a follow-up "status" is not routed as a new task.
+        self._task_states: Dict[str, TelegramTaskState] = {}
+        self._seen_update_ids: deque[int] = deque(maxlen=2048)
+        self._seen_update_id_set: set[int] = set()
 
         # Dangerous command confirmations — keyed by telegram_chat_id
         self._pending_dangerous: Dict[str, PendingDangerousCmd] = {}
+        # Generic agent-tool approval currently shown in each Telegram chat.
+        # This lets a typed "Yes"/"No" resolve the same request as the buttons.
+        self._pending_exec_approval: Dict[str, str] = {}
 
         # WhatsApp incoming — keyed by pending_id
         self._pending_wa: Dict[str, PendingWAReply] = {}
+        # Latest conversational style used by each paired Telegram chat.
+        self._chat_language_styles: Dict[str, str] = {}
         # telegram_chat_id → pending_id  (set while waiting for manual reply)
         self._wa_manual_awaiting: Dict[str, str] = {}
         # pending_id → asyncio.Task (auto-cancel timer)
@@ -226,6 +279,7 @@ class TelegramBotManager:
 
         self._poll_task = self._wa_listener_task = self._wa_cleanup_task = None
         self._active_tasks.clear()
+        self._task_states.clear()
         self._wa_manual_timers.clear()
         logger.info("Telegram Bot stopped.")
 
@@ -259,6 +313,12 @@ class TelegramBotManager:
                 if resp.status_code == 200:
                     for update in resp.json().get("result", []):
                         offset = update["update_id"] + 1
+                        if not self._claim_update(update["update_id"]):
+                            logger.info(
+                                "[TelegramBot] Ignoring duplicate update_id=%s",
+                                update["update_id"],
+                            )
+                            continue
                         if cq := update.get("callback_query"):
                             asyncio.create_task(self._handle_callback_query(cq))
                         elif msg := update.get("message"):
@@ -287,6 +347,17 @@ class TelegramBotManager:
             except Exception as exc:
                 logger.error("Unexpected error in poll loop: %s", exc, exc_info=True)
                 await asyncio.sleep(5.0)
+
+    def _claim_update(self, update_id: int) -> bool:
+        """Return False when this process has already handled the update."""
+        if update_id in self._seen_update_id_set:
+            return False
+        if len(self._seen_update_ids) == self._seen_update_ids.maxlen:
+            oldest = self._seen_update_ids.popleft()
+            self._seen_update_id_set.discard(oldest)
+        self._seen_update_ids.append(update_id)
+        self._seen_update_id_set.add(update_id)
+        return True
 
     # ──────────────────────────────────────────────────────────────────────────
     # Message handler
@@ -317,7 +388,46 @@ class TelegramBotManager:
             )
             return
 
+        self._remember_chat_language_style(chat_id, text)
         text_lower = text.lower()
+
+        pending_req_id = self._pending_exec_approval.get(chat_id)
+        if pending_req_id and text_lower in APPROVAL_YES:
+            self._pending_exec_approval.pop(chat_id, None)
+            tool_planner.resolve_tool(
+                pending_req_id,
+                approved=True,
+                user_id=f"telegram:{chat_id}",
+            )
+            await self._send_message(chat_id, "✅ অনুমোদন পেয়েছি। এখন execute করছি।")
+            return
+        if pending_req_id and text_lower in APPROVAL_NO:
+            self._pending_exec_approval.pop(chat_id, None)
+            tool_planner.resolve_tool(
+                pending_req_id,
+                approved=False,
+                user_id=f"telegram:{chat_id}",
+            )
+            await self._send_message(
+                chat_id,
+                "❌ Command বাতিল করা হয়েছে।",
+                reply_markup=self._default_keyboard(),
+            )
+            return
+
+        # A short progress question belongs to the current/backgrounded task;
+        # it must not cancel that task or enter the normal agent router.
+        if _is_task_status_request(text):
+            active = self._active_tasks.get(chat_id)
+            state = self._task_states.get(chat_id)
+            state_is_recent_background = bool(
+                state
+                and state.backgrounded
+                and (time.monotonic() - state.updated_at) <= TASK_STATUS_TTL
+            )
+            if (active and not active.done()) or state_is_recent_background:
+                await self._send_task_status(chat_id)
+                return
 
         # ── WhatsApp pairing command ───────────────────────────────────────
         if self._is_wa_pair_command(text_lower):
@@ -351,11 +461,6 @@ class TelegramBotManager:
             await self._unlock_microphone(chat_id)
             return
 
-        # ── Dangerous command detection ────────────────────────────────────
-        if self._is_dangerous_shutdown(text_lower):
-            await self._ask_shutdown_confirm(chat_id, text)
-            return
-
         # ── Emergency stop ─────────────────────────────────────────────────
         if text_lower in STOP_KEYWORDS:
             await self._emergency_stop(chat_id)
@@ -374,11 +479,66 @@ class TelegramBotManager:
             "session_id": session_id
         }))
 
+        self._task_states[chat_id] = TelegramTaskState(
+            original_text=text,
+            session_id=session_id,
+        )
         task = asyncio.create_task(
             self._process_and_reply(chat_id, text, session_id),
             name=f"tg-reply-{chat_id}",
         )
         self._active_tasks[chat_id] = task
+
+    async def _send_task_status(self, chat_id: str) -> bool:
+        """Send the latest task snapshot without starting another brain turn."""
+        state = self._task_states.get(chat_id)
+        if state is None:
+            return False
+
+        active_task = self._active_tasks.get(chat_id)
+        is_running = bool(active_task and not active_task.done())
+        age = time.monotonic() - state.updated_at
+        if not is_running and (not state.backgrounded or age > TASK_STATUS_TTL):
+            return False
+
+        end_time = time.monotonic() if is_running else state.updated_at
+        elapsed_seconds = max(0, int(end_time - state.started_at))
+        minutes, seconds = divmod(elapsed_seconds, 60)
+        elapsed = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+
+        if is_running:
+            stage = state.status or "Working..."
+            if state.active_agent:
+                stage = f"{state.active_agent}: {stage}"
+            location = "background-e " if state.backgrounded else ""
+            message = (
+                f"Agger kaj-ta ekhono {location}cholche.\n"
+                f"Elapsed: {elapsed}\n"
+                f"Current step: {stage}\n\n"
+                "Complete hole final result automatically pathabo."
+            )
+        elif state.state == "completed":
+            message = (
+                f"Agger kaj-ta complete hoyeche ({elapsed}).\n"
+                "Final result already pathano hoyeche."
+            )
+        elif state.state == "timed_out":
+            message = (
+                f"Agger kaj-ta {elapsed} por hard timeout-e stop hoyeche.\n"
+                "Same request abar dile Maya notun kore run korbe."
+            )
+        elif state.state == "failed":
+            detail = state.error or "Unknown error"
+            message = f"Agger kaj-ta fail koreche: {detail}"
+        else:
+            message = "Agger kaj-ta cancel hoyeche."
+
+        await self._send_message(
+            chat_id,
+            message,
+            reply_markup=self._default_keyboard(),
+        )
+        return True
 
     # ──────────────────────────────────────────────────────────────────────────
     # Callback query handler
@@ -388,8 +548,21 @@ class TelegramBotManager:
         cq_id   = cq.get("id")
         data    = cq.get("data", "")
         chat_id = str(cq["message"]["chat"]["id"])
+        callback_user_id = str(cq.get("from", {}).get("id", ""))
 
         await self._answer_callback(cq_id)
+        unauthorized_private_actor = bool(
+            self.chat_id
+            and not self.chat_id.startswith("-")
+            and callback_user_id != self.chat_id
+        )
+        if (
+            not self.chat_id
+            or chat_id != self.chat_id
+            or unauthorized_private_actor
+        ):
+            logger.warning("[TelegramBot] Ignoring callback from unauthorized chat.")
+            return
 
         # ── WhatsApp callbacks ─────────────────────────────────────────────
         if data.startswith("wa_gemini_"):
@@ -414,6 +587,8 @@ class TelegramBotManager:
         # ── Exec Approval Queue ────────────────────────────────────────────
         elif data.startswith("exec_approve_"):
             req_id = data[len("exec_approve_"):]
+            if self._pending_exec_approval.get(chat_id) == req_id:
+                self._pending_exec_approval.pop(chat_id, None)
             user_id = str(cq["from"].get("username", cq["from"].get("id", "telegram_user")))
             tool_planner.resolve_tool(req_id, approved=True, user_id=user_id)
             
@@ -433,6 +608,8 @@ class TelegramBotManager:
             )
         elif data.startswith("exec_deny_"):
             req_id = data[len("exec_deny_"):]
+            if self._pending_exec_approval.get(chat_id) == req_id:
+                self._pending_exec_approval.pop(chat_id, None)
             user_id = str(cq["from"].get("username", cq["from"].get("id", "telegram_user")))
             tool_planner.resolve_tool(req_id, approved=False, user_id=user_id)
             
@@ -462,6 +639,14 @@ class TelegramBotManager:
         sent_msg_id: Optional[str] = None
         current_shown  = ""
         last_edit_time = 0.0
+        turn_task: Optional[asyncio.Task] = None
+        suppressed_listener = None
+        voice_was_interrupted = False
+        turn_approval_ids: set[str] = set()
+        task_state = self._task_states.get(chat_id)
+        if task_state is None or task_state.session_id != session_id:
+            task_state = TelegramTaskState(original_text=text, session_id=session_id)
+            self._task_states[chat_id] = task_state
 
         async def _flush(*, final: bool = False) -> None:
             nonlocal sent_msg_id, current_shown, last_edit_time
@@ -485,92 +670,176 @@ class TelegramBotManager:
                 )
 
         try:
+            # Telegram owns this turn. Prevent queued or newly captured speech
+            # from running the same desktop action through the voice channel.
+            try:
+                from backend.api.main import get_active_listener
+                from backend.voice.voice_state_machine import (
+                    VoiceState,
+                    voice_state_machine,
+                )
+
+                suppressed_listener = get_active_listener()
+                if suppressed_listener is not None:
+                    suppressed_listener.suppress_remote_input()
+                voice_state_machine.discard_queued_audio()
+                await voice_state_machine.cancel_llm()
+                if voice_state_machine.state in {
+                    VoiceState.TRANSCRIBING,
+                    VoiceState.THINKING,
+                    VoiceState.SPEAKING,
+                }:
+                    voice_was_interrupted = await voice_state_machine.transition(
+                        VoiceState.INTERRUPTED
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[TelegramBot] Could not isolate voice channel: %s", exc
+                )
+
             await self._send_typing(chat_id)
 
-            async def _stream() -> None:
+            # Route the turn through the shared channel gateway: it accumulates
+            # and CoT-strips the text. We render it live via on_text and render
+            # tool-approval requests via on_event; the gateway also detects the
+            # SYSTEM_STATE / MODE_CHANGE control tokens and the stream timeout.
+            from ..brain.gateway import run_turn
+
+            async def _on_text(visible: str) -> None:
                 nonlocal full_response
-                async for chunk in orchestrator.process_user_input_stream(
-                    session_id, text
-                ):
-                    if isinstance(chunk, dict):
-                        if chunk.get("type") == "tool_call_request":
-                            data = chunk.get("data", {})
-                            req_id = data.get("request_id")
-                            tool_name = data.get("tool_name", "unknown")
-                            args = data.get("args") or data.get("payload", {})
-                            risk_level = data.get("risk_level", "UNKNOWN")
-                            
-                            # Trigger on_command_approval_request hook in the background
-                            from backend.system.hooks import trigger_hook
-                            asyncio.create_task(trigger_hook("on_command_approval_request", {
-                                "request_id": req_id,
-                                "tool_name": tool_name,
-                                "args": args,
-                                "risk_level": risk_level,
-                                "chat_id": chat_id
-                            }))
+                full_response += visible
+                task_state.updated_at = time.monotonic()
+                await _flush()
 
-                            # Build a human-friendly display for email deletion tools
-                            if tool_name in ("trash_background_email", "permanent_delete_email") and args:
-                                uid = args.get("uid", "?")
-                                subject = args.get("subject", "?")
-                                from_s = args.get("from_sender", "?")
-                                action_label = "🗑️ Move to Trash" if tool_name == "trash_background_email" else "💀 Permanently Delete"
-                                args_display = f"{action_label}\n\n📧 *Subject:* `{subject}`\n👤 *From:* `{from_s}`\n🔑 *UID:* `{uid}`"
-                            else:
-                                args_display = f"```json\n{json.dumps(args, indent=2, ensure_ascii=False)}\n```"
+            async def _on_event(chunk: dict) -> None:
+                if chunk.get("type") == "agent_status":
+                    data = chunk.get("data", {})
+                    task_state.active_agent = str(data.get("active_agent", ""))
+                    task_state.status = str(data.get("status", "Working..."))
+                    task_state.updated_at = time.monotonic()
+                    return
+                if chunk.get("type") != "tool_call_request":
+                    return
+                data = chunk.get("data", {})
+                req_id = data.get("request_id")
+                tool_name = data.get("tool_name", "unknown")
+                args = data.get("args") or data.get("payload", {})
+                risk_level = data.get("risk_level", "UNKNOWN")
+                if req_id:
+                    req_id = str(req_id)
+                    turn_approval_ids.add(req_id)
+                    self._pending_exec_approval[chat_id] = req_id
 
-                            risk_emoji = {"HIGH": "🟠", "CRITICAL": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(risk_level, "⚪")
-                            
-                            markup = {
-                                "inline_keyboard": [[
-                                    {"text": "✅ Approve", "callback_data": f"exec_approve_{req_id}"},
-                                    {"text": "❌ Deny", "callback_data": f"exec_deny_{req_id}"},
-                                ]]
-                            }
-                            await self._send_message(
-                                chat_id,
-                                f"{risk_emoji} *Maya Exec Approval* ({risk_level})\n\nMaya wants to run: `{tool_name}`\n\n{args_display}\n\nDo you approve?",
-                                reply_markup=markup
-                            )
-                        continue
-                    full_response += chunk
-                    await _flush()
+                # Trigger on_command_approval_request hook in the background
+                from backend.system.hooks import trigger_hook
+                asyncio.create_task(trigger_hook("on_command_approval_request", {
+                    "request_id": req_id,
+                    "tool_name": tool_name,
+                    "args": args,
+                    "risk_level": risk_level,
+                    "chat_id": chat_id
+                }))
 
-            try:
-                await asyncio.wait_for(_stream(), timeout=STREAM_TIMEOUT)
-            except asyncio.TimeoutError:
-                logger.warning("Stream timeout for chat=%s text=%r", chat_id, text)
-                if full_response.strip():
-                    await _flush(final=True)
-                    if sent_msg_id:
-                        await self._edit_message(
-                            chat_id, sent_msg_id,
-                            full_response.strip(),
-                            reply_markup=self._default_keyboard(),
-                        )
+                # Build a human-friendly display for email deletion tools
+                if tool_name in ("trash_background_email", "permanent_delete_email") and args:
+                    uid = args.get("uid", "?")
+                    subject = args.get("subject", "?")
+                    from_s = args.get("from_sender", "?")
+                    action_label = "🗑️ Move to Trash" if tool_name == "trash_background_email" else "💀 Permanently Delete"
+                    args_display = f"{action_label}\n\n📧 *Subject:* `{subject}`\n👤 *From:* `{from_s}`\n🔑 *UID:* `{uid}`"
                 else:
+                    args_display = f"```json\n{json.dumps(args, indent=2, ensure_ascii=False)}\n```"
+
+                risk_emoji = {"HIGH": "🟠", "CRITICAL": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(risk_level, "⚪")
+
+                markup = {
+                    "inline_keyboard": [[
+                        {"text": "✅ Approve", "callback_data": f"exec_approve_{req_id}"},
+                        {"text": "❌ Deny", "callback_data": f"exec_deny_{req_id}"},
+                    ]]
+                }
+                await self._send_message(
+                    chat_id,
+                    f"{risk_emoji} *Maya Exec Approval* ({risk_level})\n\nMaya wants to run: `{tool_name}`\n\n{args_display}\n\nDo you approve?",
+                    reply_markup=markup
+                )
+
+            turn_task = asyncio.create_task(
+                run_turn(
+                    session_id, text,
+                    on_text=_on_text, on_event=_on_event,
+                    # Telegram owns the soft/hard deadlines so the gateway does
+                    # not cancel work at the first client-facing timeout.
+                    timeout=None,
+                ),
+                name=f"tg-turn-{chat_id}",
+            )
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(turn_task), timeout=STREAM_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                task_state.backgrounded = True
+                task_state.state = "running"
+                task_state.status = task_state.status or "Working in background..."
+                task_state.updated_at = time.monotonic()
+                logger.info(
+                    "Telegram task moved to background chat=%s text=%r",
+                    chat_id, text,
+                )
+                await self._send_message(
+                    chat_id,
+                    (
+                        f"Kaj-ta {int(STREAM_TIMEOUT)} second-er beshi nicche, "
+                        "but eta background-e "
+                        "continue korche. Complete hole final result automatically "
+                        "pathabo. Majhkhane `status ki` bolle current progress dibo."
+                    ),
+                    reply_markup=self._default_keyboard(),
+                )
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.shield(turn_task),
+                        timeout=max(0.01, BACKGROUND_TASK_TIMEOUT - STREAM_TIMEOUT),
+                    )
+                except asyncio.TimeoutError:
+                    turn_task.cancel()
+                    await asyncio.gather(turn_task, return_exceptions=True)
+                    task_state.state = "timed_out"
+                    task_state.status = "Hard timeout reached."
+                    task_state.updated_at = time.monotonic()
                     await self._send_message(
-                        chat_id, "✅ কাজ হয়ে গেছে।",
+                        chat_id,
+                        (
+                            "Kaj-ta maximum background runtime cross koreche, tai "
+                            "stop kora hoyeche. Same request abar dile notun kore run hobe."
+                        ),
                         reply_markup=self._default_keyboard(),
                     )
-                return
+                    return
 
             # ── Special signal handlers ────────────────────────────────────
-            if "SYSTEM_STATE_TRIGGERED:" in full_response:
+            if result.system_state is not None:
                 await self._handle_system_state_signal(
-                    chat_id, sent_msg_id, full_response
+                    chat_id, sent_msg_id, result.raw_text
                 )
+                task_state.state = "completed"
+                task_state.final_text = result.final_text
+                task_state.updated_at = time.monotonic()
                 return
 
-            if "MODE_CHANGE_TRIGGERED:" in full_response:
+            if result.mode_change is not None:
                 await self._handle_mode_change_signal(
-                    chat_id, sent_msg_id, full_response
+                    chat_id, sent_msg_id, result.raw_text
                 )
+                task_state.state = "completed"
+                task_state.final_text = result.final_text
+                task_state.updated_at = time.monotonic()
                 return
 
             # ── Final send ────────────────────────────────────────────────
-            final_text = full_response.strip() or "✅ কাজ হয়ে গেছে।"
+            # Gateway already stripped any leaked model chain-of-thought.
+            final_text = result.final_text or "✅ কাজ হয়ে গেছে।"
             if sent_msg_id:
                 await self._edit_message(chat_id, sent_msg_id, final_text)
                 await self._send_message(
@@ -580,15 +849,29 @@ class TelegramBotManager:
                 await self._send_message(
                     chat_id, final_text, reply_markup=self._default_keyboard()
                 )
+            task_state.state = "completed"
+            task_state.status = "Completed."
+            task_state.final_text = final_text
+            task_state.updated_at = time.monotonic()
 
             # ── Auto screenshot for visual/navigation commands ─────────────
             if any(kw in text.lower() for kw in SCREENSHOT_TRIGGER_KEYWORDS):
                 await self._send_screenshot(chat_id, "📷 *Current Screen State:*")
 
         except asyncio.CancelledError:
+            task_state.state = "cancelled"
+            task_state.status = "Cancelled by a newer request."
+            task_state.updated_at = time.monotonic()
+            if turn_task and not turn_task.done():
+                turn_task.cancel()
+                await asyncio.gather(turn_task, return_exceptions=True)
             logger.info("Task cancelled for chat_id=%s", chat_id)
             raise
         except Exception as exc:
+            task_state.state = "failed"
+            task_state.status = "Failed."
+            task_state.error = str(exc)
+            task_state.updated_at = time.monotonic()
             logger.error(
                 "Error processing command for chat=%s: %s", chat_id, exc, exc_info=True
             )
@@ -598,7 +881,29 @@ class TelegramBotManager:
                 reply_markup=self._default_keyboard(),
             )
         finally:
-            self._active_tasks.pop(chat_id, None)
+            if self._pending_exec_approval.get(chat_id) in turn_approval_ids:
+                self._pending_exec_approval.pop(chat_id, None)
+            if turn_task and not turn_task.done():
+                turn_task.cancel()
+                await asyncio.gather(turn_task, return_exceptions=True)
+            current = asyncio.current_task()
+            if self._active_tasks.get(chat_id) is current:
+                self._active_tasks.pop(chat_id, None)
+            if suppressed_listener is not None:
+                suppressed_listener.resume_remote_input()
+            if voice_was_interrupted:
+                try:
+                    from backend.voice.voice_state_machine import (
+                        VoiceState,
+                        voice_state_machine,
+                    )
+
+                    if voice_state_machine.state == VoiceState.INTERRUPTED:
+                        await voice_state_machine.transition(VoiceState.LISTENING)
+                except Exception as exc:
+                    logger.warning(
+                        "[TelegramBot] Could not restore voice listening: %s", exc
+                    )
 
     # ──────────────────────────────────────────────────────────────────────────
     # WhatsApp incoming notification
@@ -622,38 +927,204 @@ class TelegramBotManager:
         )
         self._pending_wa[pending.id] = pending
 
-        text, markup = self._build_wa_notification(pending)
+        style = get_latest_conversation_style()
+        text, markup = self._build_wa_notification(pending, style)
         await self._send_message(self.chat_id, text, reply_markup=markup)
 
+    @staticmethod
+    def _wa_ui_copy(style: str) -> dict[str, str]:
+        if style == BANGLISH:
+            return {
+                "unknown_title": "Unknown number theke WhatsApp message!",
+                "unknown_tag": "ochena",
+                "allow": "Allow koro",
+                "manual": "Nije likhi",
+                "group_title": "Group-e mention!",
+                "context_none": "[Context: nei]",
+                "group_warning": (
+                    "GROUP MESSAGE - reply deyar age bhalo kore dekho!"
+                ),
+                "direct_title": "Notun WhatsApp message!",
+                "authorization_required": (
+                    "Age sender-ke allow koro; tar age WhatsApp reply create "
+                    "ba send kora jabe na."
+                ),
+                "drafting": "Gemini draft create korchi...",
+                "draft_empty": "Gemini empty reply diyeche.",
+                "no_draft": "Kono draft paoa gelo na.",
+                "send_draft": "Eta pathao",
+                "edit": "Edit koro",
+                "cancel": "Cancel",
+                "manual_prompt": (
+                    "*Reply type koro:*\n_(Pach minute time ache)_"
+                ),
+                "ignored": (
+                    "*Ignored.* WhatsApp-e kono reply jabe na."
+                ),
+                "allow_failed": (
+                    "WhatsApp sender-ke allow kora gelo na. "
+                    "Service connection check koro."
+                ),
+                "allow_success": (
+                    "*+{number} allow kora hoyeche!* Future notification-e "
+                    "known sender hisebe dhora hobe.\n\nReply option choose koro:"
+                ),
+                "block_failed": (
+                    "WhatsApp sender-ke block kora gelo na. "
+                    "Service connection check koro."
+                ),
+                "block_success": (
+                    "*+{number} block kora hoyeche!* Ei number theke ar "
+                    "notification asbe na."
+                ),
+                "manual_timeout": (
+                    "*Timeout* - manual reply cancel hoyeche."
+                ),
+                "reply_sent": "*Reply sent!*",
+                "reply_failed": (
+                    "WhatsApp-e reply pathano gelo na. WhatsApp connected ache?"
+                ),
+            }
+        if style == HINDILISH:
+            return {
+                "unknown_title": "Unknown number se WhatsApp message!",
+                "unknown_tag": "anjaan",
+                "allow": "Allow karo",
+                "manual": "Khud likhu",
+                "group_title": "Group me mention!",
+                "context_none": "[Context: nahi]",
+                "group_warning": (
+                    "GROUP MESSAGE - reply karne se pehle dhyan se dekho!"
+                ),
+                "direct_title": "Naya WhatsApp message!",
+                "authorization_required": (
+                    "Pehle sender ko allow karo; usse pehle WhatsApp reply "
+                    "create ya send nahi hoga."
+                ),
+                "drafting": "Gemini draft bana raha hoon...",
+                "draft_empty": "Gemini ne empty reply diya.",
+                "no_draft": "Koi draft nahi mila.",
+                "send_draft": "Ye bhejo",
+                "edit": "Edit karo",
+                "cancel": "Cancel",
+                "manual_prompt": (
+                    "*Apna reply type karo:*\n_(Paanch minute ka time hai)_"
+                ),
+                "ignored": (
+                    "*Ignored.* WhatsApp par koi reply nahi bheja jayega."
+                ),
+                "allow_failed": (
+                    "WhatsApp sender ko allow nahi kiya ja saka. "
+                    "Service connection check karo."
+                ),
+                "allow_success": (
+                    "*+{number} allow ho gaya!* Future notifications me ise "
+                    "known sender mana jayega.\n\nReply option choose karo:"
+                ),
+                "block_failed": (
+                    "WhatsApp sender ko block nahi kiya ja saka. "
+                    "Service connection check karo."
+                ),
+                "block_success": (
+                    "*+{number} block ho gaya!* Is number se ab notification "
+                    "nahi aayega."
+                ),
+                "manual_timeout": (
+                    "*Timeout* - manual reply cancel ho gaya."
+                ),
+                "reply_sent": "*Reply sent!*",
+                "reply_failed": (
+                    "WhatsApp par reply nahi bheja ja saka. "
+                    "WhatsApp connected hai?"
+                ),
+            }
+        return {
+            "unknown_title": "WhatsApp message from an unknown number!",
+            "unknown_tag": "unknown",
+            "allow": "Allow",
+            "manual": "Write reply",
+            "group_title": "Group mention!",
+            "context_none": "[Context: none]",
+            "group_warning": (
+                "GROUP MESSAGE - review it carefully before replying!"
+            ),
+            "direct_title": "New WhatsApp message!",
+            "authorization_required": (
+                "Allow the sender first; no WhatsApp reply can be created or "
+                "sent before that."
+            ),
+            "drafting": "Creating a Gemini draft...",
+            "draft_empty": "Gemini returned an empty reply.",
+            "no_draft": "No draft was found.",
+            "send_draft": "Send this",
+            "edit": "Edit",
+            "cancel": "Cancel",
+            "manual_prompt": (
+                "*Type your reply:*\n_(You have five minutes)_"
+            ),
+            "ignored": "*Ignored.* No WhatsApp reply will be sent.",
+            "allow_failed": (
+                "The WhatsApp sender could not be allowed. "
+                "Check the service connection."
+            ),
+            "allow_success": (
+                "*+{number} allowed!* Future notifications from this sender "
+                "will be treated as known.\n\nChoose a reply option:"
+            ),
+            "block_failed": (
+                "The WhatsApp sender could not be blocked. "
+                "Check the service connection."
+            ),
+            "block_success": (
+                "*+{number} blocked!* No more notifications will be shown "
+                "from this number."
+            ),
+            "manual_timeout": "*Timeout* - manual reply cancelled.",
+            "reply_sent": "*Reply sent!*",
+            "reply_failed": (
+                "The WhatsApp reply could not be sent. Is WhatsApp connected?"
+            ),
+        }
+
     def _build_wa_notification(
-        self, p: PendingWAReply
+        self, p: PendingWAReply, style: str = ENGLISH
     ) -> tuple[str, dict]:
+        copy = self._wa_ui_copy(style)
+
         reply_row = [
             {"text": "🤖 Gemini Draft", "callback_data": f"wa_gemini_{p.id}"},
-            {"text": "✏️ নিজে লিখি",    "callback_data": f"wa_manual_{p.id}"},
-            {"text": "❌ Ignore",         "callback_data": f"wa_ignore_{p.id}"},
+            {"text": f"✏️ {copy['manual']}", "callback_data": f"wa_manual_{p.id}"},
+            {"text": "❌ Ignore", "callback_data": f"wa_ignore_{p.id}"},
         ]
 
         if not p.is_known and not p.is_group:
             text = (
-                "📩 *অজানা নম্বর থেকে WhatsApp মেসেজ!*\n\n"
-                f"👤 {p.from_name} (+{p.from_number}) _(অচেনা)_\n"
+                f"📩 *{copy['unknown_title']}*\n\n"
+                f"👤 {p.from_name} (+{p.from_number}) _({copy['unknown_tag']})_\n"
                 f"─────────────────────────\n"
                 f'"{p.trigger_msg}"\n'
                 "─────────────────────────"
             )
             markup = {
                 "inline_keyboard": [[
-                    {"text": "✅ Allow করো",   "callback_data": f"wa_allow_{p.id}"},
-                    {"text": "🚫 Block",        "callback_data": f"wa_block_{p.id}"},
-                    {"text": "❌ Ignore",        "callback_data": f"wa_ignore_{p.id}"},
+                    {"text": f"✅ {copy['allow']}", "callback_data": f"wa_allow_{p.id}"},
+                    {"text": "🚫 Block", "callback_data": f"wa_block_{p.id}"},
+                    {"text": "❌ Ignore", "callback_data": f"wa_ignore_{p.id}"},
                 ]]
             }
         elif p.is_group:
-            ctx = f"[Context: {len(p.context_messages)}টা আগের message]" \
-                  if p.context_messages else "[Context: নেই]"
+            context_count = len(p.context_messages)
+            if not context_count:
+                ctx = copy["context_none"]
+            elif style == BANGLISH:
+                ctx = f"[Context: {context_count}-ta ager message]"
+            elif style == HINDILISH:
+                ctx = f"[Context: {context_count} pichhle message]"
+            else:
+                suffix = "" if context_count == 1 else "s"
+                ctx = f"[Context: {context_count} previous message{suffix}]"
             text = (
-                "💬 *Group-এ Mention!*\n\n"
+                f"💬 *{copy['group_title']}*\n\n"
                 f"👥 *Group:* {p.group_name}\n"
                 f"👤 *Sender:* {p.from_name} (+{p.from_number})\n"
                 f"─────────────────────────\n"
@@ -661,12 +1132,12 @@ class TelegramBotManager:
                 f"─────────────────────────\n"
                 f'"{p.trigger_msg}"\n'
                 "─────────────────────────\n"
-                "⚠️ GROUP মেসেজ — ভালো করে দেখে reply করুন!"
+                f"⚠️ {copy['group_warning']}"
             )
             markup = {"inline_keyboard": [reply_row]}
         else:
             text = (
-                "💬 *নতুন WhatsApp মেসেজ!*\n\n"
+                f"💬 *{copy['direct_title']}*\n\n"
                 f"👤 *From:* {p.from_name} (+{p.from_number})\n"
                 "📍 *Chat:* Personal (Direct)\n"
                 f"─────────────────────────\n"
@@ -677,17 +1148,47 @@ class TelegramBotManager:
 
         return text, markup
 
+    def _remember_chat_language_style(self, chat_id: str, text: str) -> str:
+        """Track the paired user's latest Maya conversation style."""
+        style = detect_language_style(
+            text,
+            fallback=self._chat_language_styles.get(chat_id),
+        )
+        self._chat_language_styles[chat_id] = style
+        set_latest_conversation_style(style)
+        return style
+
+    def _chat_language_style(self, chat_id: str) -> str:
+        return get_latest_conversation_style()
+
     # ──────────────────────────────────────────────────────────────────────────
     # WhatsApp callback actions
     # ──────────────────────────────────────────────────────────────────────────
+
+    async def _require_wa_reply_authorization(
+        self, chat_id: str, pending: PendingWAReply
+    ) -> bool:
+        """Keep unknown direct senders reply-blocked even for forged callbacks."""
+        if pending.is_group or pending.is_known:
+            return True
+        copy = self._wa_ui_copy(self._chat_language_style(chat_id))
+        await self._send_message(
+            chat_id,
+            copy["authorization_required"],
+            reply_markup=self._default_keyboard(),
+        )
+        return False
 
     async def _wa_cb_gemini(self, chat_id: str, pending_id: str) -> None:
         pending = self._pending_wa.get(pending_id)
         if not pending:
             await self._send_message(chat_id, "⚠️ Pending message not found (expired?).")
             return
+        if not await self._require_wa_reply_authorization(chat_id, pending):
+            return
 
-        await self._send_message(chat_id, "⏳ Gemini draft তৈরি করছে...")
+        copy = self._wa_ui_copy(self._chat_language_style(chat_id))
+        await self._send_message(chat_id, f"⏳ {copy['drafting']}")
 
         context_lines = "".join(
             f"[{m.get('name', m.get('from', '?'))}]: {m.get('body', '')}\n"
@@ -698,11 +1199,8 @@ class TelegramBotManager:
             "Respond naturally, casually, and friendly like a human assistant.\n"
             "CRITICAL: DO NOT sound like a robotic customer service bot. DO NOT say 'How can I help you?'.\n\n"
             "🌐 LANGUAGE RULE:\n"
-            "- Detect the language of the triggering message.\n"
-            "- Reply in that EXACT same language.\n"
-            "- Supported: English, Bengali (বাংলা), Hindi (हिंदी).\n"
-            "- If mixed (e.g., Banglish), reply in the dominant language.\n"
-            "- NEVER switch languages.\n\n"
+            f"- {response_style_directive(detect_language_style(pending.trigger_msg))}\n"
+            "- Maya supports Banglish, Hindilish, and English; all replies use Latin letters.\n\n"
             "Style: short, conversational, plain text only — like a real WhatsApp message. No markdown.\n\n"
             f"[Previous conversation — context only]\n"
             f"{context_lines or '(no prior context)'}\n"
@@ -714,12 +1212,11 @@ class TelegramBotManager:
 
         draft = ""
         try:
-            async for chunk in orchestrator.process_user_input_stream(
-                f"wa_draft_{pending_id}", prompt
-            ):
-                if not isinstance(chunk, dict):
-                    draft += chunk
-            draft = draft.strip()
+            # Route through the shared channel gateway: it accumulates the text,
+            # strips any leaked model chain-of-thought, and drops control tokens.
+            from ..brain.gateway import run_turn
+            result = await run_turn(f"wa_draft_{pending_id}", prompt)
+            draft = result.final_text
         except Exception as exc:
             await self._send_message(
                 chat_id, f"❌ Gemini error: {exc}",
@@ -729,7 +1226,7 @@ class TelegramBotManager:
 
         if not draft:
             await self._send_message(
-                chat_id, "❌ Gemini খালি reply দিয়েছে।",
+                chat_id, f"❌ {copy['draft_empty']}",
                 reply_markup=self._default_keyboard(),
             )
             return
@@ -739,9 +1236,9 @@ class TelegramBotManager:
 
         markup = {
             "inline_keyboard": [[
-                {"text": "✅ এটাই পাঠাও", "callback_data": f"wa_send_draft_{pending_id}"},
-                {"text": "✏️ Edit করো",   "callback_data": f"wa_manual_{pending_id}"},
-                {"text": "❌ Cancel",      "callback_data": f"wa_ignore_{pending_id}"},
+                {"text": f"✅ {copy['send_draft']}", "callback_data": f"wa_send_draft_{pending_id}"},
+                {"text": f"✏️ {copy['edit']}", "callback_data": f"wa_manual_{pending_id}"},
+                {"text": f"❌ {copy['cancel']}", "callback_data": f"wa_ignore_{pending_id}"},
             ]]
         }
         await self._send_message(
@@ -755,19 +1252,26 @@ class TelegramBotManager:
         if not pending:
             await self._send_message(chat_id, "⚠️ Pending message not found (expired?).")
             return
+        if not await self._require_wa_reply_authorization(chat_id, pending):
+            return
         if not pending.gemini_draft:
-            await self._send_message(chat_id, "❌ No draft found.")
+            copy = self._wa_ui_copy(self._chat_language_style(chat_id))
+            await self._send_message(chat_id, f"❌ {copy['no_draft']}")
             return
         await self._send_wa_reply(chat_id, pending, pending.gemini_draft)
 
     async def _wa_cb_manual(self, chat_id: str, pending_id: str) -> None:
-        if pending_id not in self._pending_wa:
+        pending = self._pending_wa.get(pending_id)
+        if not pending:
             await self._send_message(chat_id, "⚠️ Pending message not found (expired?).")
             return
+        if not await self._require_wa_reply_authorization(chat_id, pending):
+            return
+        copy = self._wa_ui_copy(self._chat_language_style(chat_id))
         self._wa_manual_awaiting[chat_id] = pending_id
         await self._send_message(
             chat_id,
-            "✏️ *আপনার reply টাইপ করুন:*\n_(পাঁচ মিনিট সময় আছে)_",
+            f"✏️ {copy['manual_prompt']}",
         )
         # Cancel any existing timer for this pending_id
         if old := self._wa_manual_timers.pop(pending_id, None):
@@ -781,9 +1285,10 @@ class TelegramBotManager:
     async def _wa_cb_ignore(self, chat_id: str, pending_id: str) -> None:
         self._pending_wa.pop(pending_id, None)
         self._cancel_manual_timer(pending_id)
+        copy = self._wa_ui_copy(self._chat_language_style(chat_id))
         await self._send_message(
             chat_id,
-            "✅ *Ignored.* WhatsApp-এ কোনো reply যাবে না।",
+            f"✅ {copy['ignored']}",
             reply_markup=self._default_keyboard(),
         )
 
@@ -793,31 +1298,47 @@ class TelegramBotManager:
             await self._send_message(chat_id, "⚠️ Pending message not found (expired?).")
             return
         from backend.tools.desktop.advanced.whatsapp_manager import whatsapp_manager
-        whatsapp_manager.register_known_sender(pending.from_number)
+        copy = self._wa_ui_copy(self._chat_language_style(chat_id))
+        if not whatsapp_manager.register_known_sender(pending.from_number):
+            await self._send_message(
+                chat_id,
+                copy["allow_failed"],
+                reply_markup=self._default_keyboard(),
+            )
+            return
         pending.is_known = True
         markup = {
             "inline_keyboard": [[
                 {"text": "🤖 Gemini Draft", "callback_data": f"wa_gemini_{pending_id}"},
-                {"text": "✏️ নিজে লিখি",   "callback_data": f"wa_manual_{pending_id}"},
-                {"text": "❌ Ignore",         "callback_data": f"wa_ignore_{pending_id}"},
+                {"text": f"✏️ {copy['manual']}", "callback_data": f"wa_manual_{pending_id}"},
+                {"text": "❌ Ignore", "callback_data": f"wa_ignore_{pending_id}"},
             ]]
         }
         await self._send_message(
             chat_id,
-            f"✅ *+{pending.from_number} অনুমোদিত!* ভবিষ্যতে অটো-notification আসবে।\n\nReply দিতে চাইলে:",
+            f"✅ {copy['allow_success'].format(number=pending.from_number)}",
             reply_markup=markup,
         )
 
     async def _wa_cb_block(self, chat_id: str, pending_id: str) -> None:
-        pending = self._pending_wa.pop(pending_id, None)
+        pending = self._pending_wa.get(pending_id)
         if not pending:
             await self._send_message(chat_id, "⚠️ Pending message not found (expired?).")
             return
         from backend.tools.desktop.advanced.whatsapp_manager import whatsapp_manager
-        whatsapp_manager.block_sender(pending.from_number)
+        copy = self._wa_ui_copy(self._chat_language_style(chat_id))
+        if not whatsapp_manager.block_sender(pending.from_number):
+            await self._send_message(
+                chat_id,
+                copy["block_failed"],
+                reply_markup=self._default_keyboard(),
+            )
+            return
+        self._pending_wa.pop(pending_id, None)
+        self._cancel_manual_timer(pending_id)
         await self._send_message(
             chat_id,
-            f"🚫 *+{pending.from_number} ব্লক!* এই নম্বর থেকে আর notification আসবে না।",
+            f"🚫 {copy['block_success'].format(number=pending.from_number)}",
             reply_markup=self._default_keyboard(),
         )
 
@@ -828,12 +1349,17 @@ class TelegramBotManager:
     async def _complete_manual_wa_reply(
         self, chat_id: str, pending_id: str, text: str
     ) -> None:
-        self._cancel_manual_timer(pending_id)
-        self._wa_manual_awaiting.pop(chat_id, None)
-        pending = self._pending_wa.pop(pending_id, None)
+        pending = self._pending_wa.get(pending_id)
         if not pending:
             await self._send_message(chat_id, "⚠️ Pending message not found (expired?).")
             return
+        if not await self._require_wa_reply_authorization(chat_id, pending):
+            self._cancel_manual_timer(pending_id)
+            self._wa_manual_awaiting.pop(chat_id, None)
+            return
+        self._cancel_manual_timer(pending_id)
+        self._wa_manual_awaiting.pop(chat_id, None)
+        self._pending_wa.pop(pending_id, None)
         await self._send_wa_reply(chat_id, pending, text)
 
     async def _manual_timeout_handler(
@@ -846,9 +1372,10 @@ class TelegramBotManager:
                 self._wa_manual_awaiting.pop(chat_id, None)
                 self._pending_wa.pop(pending_id, None)
                 self._wa_manual_timers.pop(pending_id, None)
+                copy = self._wa_ui_copy(self._chat_language_style(chat_id))
                 await self._send_message(
                     chat_id,
-                    "⏱️ *Timeout* — Manual reply বাতিল হয়েছে।",
+                    f"⏱️ {copy['manual_timeout']}",
                     reply_markup=self._default_keyboard(),
                 )
         except asyncio.CancelledError:
@@ -861,19 +1388,22 @@ class TelegramBotManager:
     async def _send_wa_reply(
         self, chat_id: str, pending: PendingWAReply, reply_text: str
     ) -> None:
+        if not await self._require_wa_reply_authorization(chat_id, pending):
+            return
         from backend.tools.desktop.advanced.whatsapp_manager import whatsapp_manager
+        copy = self._wa_ui_copy(self._chat_language_style(chat_id))
         ok = whatsapp_manager.reply_to_chat(pending.chat_id_wa, reply_text)
         self._pending_wa.pop(pending.id, None)
         if ok:
             await self._send_message(
                 chat_id,
-                f"✅ *Reply sent!*\n\n`{reply_text}`",
+                f"✅ {copy['reply_sent']}\n\n`{reply_text}`",
                 reply_markup=self._default_keyboard(),
             )
         else:
             await self._send_message(
                 chat_id,
-                "❌ WhatsApp-এ reply পাঠানো যায়নি। WhatsApp connected আছে?",
+                f"❌ {copy['reply_failed']}",
                 reply_markup=self._default_keyboard(),
             )
 
@@ -905,13 +1435,21 @@ class TelegramBotManager:
                 reply_markup=self._default_keyboard(),
             )
             return
-        await self._send_message(
-            chat_id,
-            "⚙️ *Shutdown শুরু হচ্ছে...*\n\nChrome বন্ধ → 10 সেকেন্ড পর বন্ধ হবে। 🔴",
-        )
         try:
-            from backend.system.shutdown_manager import shutdown_manager
-            await shutdown_manager.trigger_windows_shutdown(delay_seconds=10)
+            from backend.tools.unified import pc
+
+            result = await asyncio.to_thread(pc, action="shutdown")
+            if str(result).upper().startswith(("ERR", "FAIL", "BLOCKED")):
+                await self._send_message(
+                    chat_id,
+                    f"❌ Shutdown execute করা যায়নি: {result}",
+                    reply_markup=self._default_keyboard(),
+                )
+                return
+            await self._send_message(
+                chat_id,
+                "✅ Shutdown command execute হয়েছে। ৫ সেকেন্ডের মধ্যে PC বন্ধ হবে।",
+            )
         except Exception as exc:
             await self._send_message(
                 chat_id, f"❌ Shutdown error: {exc}",
@@ -1197,7 +1735,7 @@ class TelegramBotManager:
                     reply_markup=self._default_keyboard(),
                 )
                 return
-            if listener.is_locked:
+            if listener.is_manually_locked:
                 await self._send_message(
                     chat_id,
                     "🔒 *Microphone ইতিমধ্যে Locked আছে!*\n\nUnlock করতে `/unlock` পাঠাও।",
@@ -1231,7 +1769,7 @@ class TelegramBotManager:
                     reply_markup=self._default_keyboard(),
                 )
                 return
-            if not listener.is_locked:
+            if not listener.is_manually_locked:
                 await self._send_message(
                     chat_id,
                     "🔓 *Microphone ইতিমধ্যে Unlocked আছে!*\n\nMaya সক্রিয়ভাবে শুনছে।",
@@ -1491,19 +2029,19 @@ class TelegramBotManager:
 
     @staticmethod
     def _detect_language_hint(text: str) -> str:
-        bengali   = sum(1 for c in text if "\u0980" <= c <= "\u09ff")
-        devanag   = sum(1 for c in text if "\u0900" <= c <= "\u097f")
-        if bengali > 2:
-            return "🌐 Detected: Bengali"
-        if devanag > 2:
-            return "🌐 Detected: Hindi"
-        return "🌐 Detected: English"
+        style = detect_language_style(text)
+        if style == BANGLISH:
+            return "🌐 Detected style: Banglish"
+        if style == HINDILISH:
+            return "🌐 Detected style: Hindilish"
+        return "🌐 Detected style: English"
 
     @staticmethod
     def _default_keyboard() -> dict:
         return {
             "keyboard": [
                 [{"text": "🛑 Emergency Stop"}, {"text": "📸 Get Screenshot"}],
+                [{"text": "🔒 Mic Lock"},       {"text": "🔓 Mic Unlock"}],
                 [{"text": "📊 Check Status"},   {"text": "🔑 WhatsApp Link"}],
                 [{"text": "❓ Help & Guide"},   {"text": "👤 Unpair Bot"}],
             ],

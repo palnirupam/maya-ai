@@ -3,10 +3,63 @@ import {
   X, Key, Shield, Lock, Eye, EyeOff,
   CheckCircle, XCircle, Loader2, Volume2, Send,
 } from 'lucide-react';
+import { backendHttpUrl } from '../../services/websocket';
+import { requireOk } from '../../services/http';
 
 interface Props { isOpen: boolean; onClose: () => void; }
 type Tab = 'providers' | 'voice' | 'permissions' | 'telegram';
 type SaveStatus = 'idle' | 'testing' | 'saving' | 'success' | 'error';
+type ProviderOption = {
+  id: string;
+  label: string;
+  default_model: string;
+  requires_base_url: boolean;
+};
+
+const DEFAULT_MODEL_BY_PROVIDER: Record<string, string> = {
+  gemini: 'gemini-3.5-flash',
+  openrouter: 'deepseek/deepseek-chat-v3-0324:free',
+  nvidia: 'meta/llama-3.3-70b-instruct',
+  groq: 'llama-3.3-70b-versatile',
+  opencode_zen: 'deepseek-v4-flash-free',
+  openai: 'gpt-4o-mini',
+  cloudflare: '@cf/meta/llama-3.1-8b-instruct',
+  custom_openai: 'gpt-4o-mini',
+  anthropic: 'claude-3-5-haiku-latest',
+};
+
+const FALLBACK_PROVIDER_OPTIONS: ProviderOption[] = [
+  { id: 'gemini', label: 'Google Gemini', default_model: DEFAULT_MODEL_BY_PROVIDER.gemini, requires_base_url: false },
+  { id: 'openrouter', label: 'OpenRouter', default_model: DEFAULT_MODEL_BY_PROVIDER.openrouter, requires_base_url: false },
+  { id: 'nvidia', label: 'NVIDIA NIM', default_model: DEFAULT_MODEL_BY_PROVIDER.nvidia, requires_base_url: false },
+  { id: 'groq', label: 'Groq', default_model: DEFAULT_MODEL_BY_PROVIDER.groq, requires_base_url: false },
+  { id: 'opencode_zen', label: 'OpenCode Zen', default_model: DEFAULT_MODEL_BY_PROVIDER.opencode_zen, requires_base_url: false },
+  { id: 'openai', label: 'OpenAI', default_model: DEFAULT_MODEL_BY_PROVIDER.openai, requires_base_url: false },
+  { id: 'cloudflare', label: 'Cloudflare Workers AI', default_model: DEFAULT_MODEL_BY_PROVIDER.cloudflare, requires_base_url: true },
+  { id: 'custom_openai', label: 'Custom OpenAI-compatible', default_model: DEFAULT_MODEL_BY_PROVIDER.custom_openai, requires_base_url: true },
+  { id: 'anthropic', label: 'Claude API', default_model: DEFAULT_MODEL_BY_PROVIDER.anthropic, requires_base_url: false },
+];
+
+const defaultModelForProvider = (provider?: string) =>
+  DEFAULT_MODEL_BY_PROVIDER[provider || 'gemini'] || DEFAULT_MODEL_BY_PROVIDER.gemini;
+
+const isModelCompatible = (provider: string, model: string) => {
+  if (!model) return false;
+  if (provider === 'gemini') return model.startsWith('gemini-');
+  if (provider === 'openrouter') return true;
+  if (provider === 'cloudflare') return model.startsWith('@cf/');
+  if (provider === 'anthropic') return model.startsWith('claude-');
+  return !model.startsWith('gemini-') && !model.startsWith('google/');
+};
+
+const keyPlaceholderForProvider = (provider: string) => {
+  if (provider === 'openrouter') return 'sk-or-...';
+  if (provider === 'nvidia') return 'nvapi-...';
+  if (provider === 'groq') return 'gsk_...';
+  if (provider === 'anthropic') return 'sk-ant-...';
+  if (provider === 'openai' || provider === 'opencode_zen') return 'sk-...';
+  return 'Paste provider API key...';
+};
 
 export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [activeTab, setActiveTab] = useState<Tab>('providers');
@@ -17,6 +70,10 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [geminiStatus, setGeminiStatus] = useState<SaveStatus>('idle');
   const [geminiError, setGeminiError]   = useState('');
   const [geminiConfigured, setGeminiConfigured] = useState(false);
+  const [activeModel, setActiveModel] = useState('gemini-3.5-flash');
+  const [geminiProvider, setGeminiProvider] = useState('gemini');
+  const [geminiBaseUrl, setGeminiBaseUrl] = useState('');
+  const [providerOptions, setProviderOptions] = useState<ProviderOption[]>(FALLBACK_PROVIDER_OPTIONS);
 
   // ElevenLabs
   const [elevenlabsKey, setElevenlabsKey] = useState('');
@@ -26,7 +83,7 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const [elevenlabsStatus, setElevenlabsStatus] = useState<SaveStatus>('idle');
   const [elevenlabsError, setElevenlabsError] = useState('');
   const [elevenlabsConfigured, setElevenlabsConfigured] = useState(false);
-  const [ttsPrimaryProvider, setTtsPrimaryProvider] = useState('edge');
+  const [ttsPrimaryProvider, setTtsPrimaryProvider] = useState('gemini');
 
   // Permissions
   const [perms, setPerms] = useState({
@@ -37,6 +94,7 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
     auto_approve: false,
     web_search: false,
   });
+  const [permissionError, setPermissionError] = useState('');
 
   // Telegram
   const [telegramEnabled, setTelegramEnabled] = useState(false);
@@ -51,13 +109,21 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
 
   useEffect(() => {
     if (!isOpen) return;
-    fetch('http://127.0.0.1:8000/settings/status')
+    fetch(`${backendHttpUrl}/settings/status`)
       .then(r => r.json())
       .then(data => {
         if (data.gemini_configured) {
           setGeminiConfigured(true);
           setGeminiKey('••••••••••••••••••••••••••••••••••••••••');
         }
+        if (Array.isArray(data.provider_options) && data.provider_options.length) {
+          setProviderOptions(data.provider_options);
+        }
+        const provider = data.gemini_provider || 'gemini';
+        setGeminiProvider(provider);
+        setGeminiBaseUrl(data.gemini_base_url || '');
+        const model = data.gemini_active_model || defaultModelForProvider(provider);
+        setActiveModel(isModelCompatible(provider, model) ? model : defaultModelForProvider(provider));
         if (data.elevenlabs_configured) {
           setElevenlabsConfigured(true);
           setElevenlabsKey('••••••••••••••••••••••••••••••••••••••••');
@@ -84,7 +150,7 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
       })
       .catch(console.error);
 
-    fetch('http://127.0.0.1:8000/settings/telegram')
+    fetch(`${backendHttpUrl}/settings/telegram`)
       .then(r => r.json())
       .then(data => {
         setTelegramEnabled(!!data.enabled);
@@ -100,21 +166,60 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   }, [isOpen]);
 
   // ── Gemini ─────────────────────────────────────────────────────────────────
+  const selectedProvider = providerOptions.find(p => p.id === geminiProvider);
+  const providerRequiresBaseUrl = !!selectedProvider?.requires_base_url;
+
+  const changeBrainProvider = (provider: string) => {
+    setGeminiProvider(provider);
+    if (!isModelCompatible(provider, activeModel)) {
+      setActiveModel(defaultModelForProvider(provider));
+    }
+  };
+
   const saveGeminiKey = async () => {
-    if (!geminiKey || geminiKey.includes('•')) return;
-    setGeminiStatus('testing'); setGeminiError('');
+    const keyChanged = !!geminiKey && !geminiKey.includes('•');
+    const model = activeModel.trim();
+    const baseUrl = geminiBaseUrl.trim();
+    if (!keyChanged && !model) return;
+    setGeminiStatus(keyChanged ? 'testing' : 'saving'); setGeminiError('');
     try {
-      const tr = await fetch('http://127.0.0.1:8000/settings/test-key', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ gemini_key: geminiKey }),
-      });
-      if (!tr.ok) { const e = await tr.json(); throw new Error(e.detail || 'Invalid key'); }
+      let provider = geminiProvider;
+      if (providerRequiresBaseUrl && !baseUrl) {
+        throw new Error('Base URL required for this provider');
+      }
+      if (keyChanged) {
+        const tr = await fetch(`${backendHttpUrl}/settings/test-key`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            gemini_key: geminiKey,
+            provider,
+            active_model: model,
+            base_url: baseUrl,
+          }),
+        });
+        await requireOk(tr, 'Invalid key');
+        const testResult = await tr.json();
+        provider = testResult.provider || provider;
+        setGeminiProvider(provider);
+      }
       setGeminiStatus('saving');
-      await fetch('http://127.0.0.1:8000/settings/keys', {
+      const activeModelForProvider = isModelCompatible(provider, model)
+        ? model
+        : defaultModelForProvider(provider);
+      const payload: any = { active_model: activeModelForProvider, provider, base_url: baseUrl };
+      if (keyChanged) {
+        payload.gemini_key = geminiKey;
+      }
+      const saveResponse = await fetch(`${backendHttpUrl}/settings/keys`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ gemini_key: geminiKey }),
+        body: JSON.stringify(payload),
       });
+      await requireOk(saveResponse, 'Failed to save brain provider settings');
+      setActiveModel(activeModelForProvider);
       setGeminiStatus('success'); setGeminiConfigured(true);
+      if (keyChanged) {
+        setGeminiKey('••••••••••••••••••••••••••••••••••••••••');
+      }
       setTimeout(() => setGeminiStatus('idle'), 3000);
     } catch (e: any) { setGeminiError(e.message); setGeminiStatus('error'); }
   };
@@ -125,11 +230,11 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
     try {
       // Validate key if it was changed (doesn't contain bullets)
       if (!elevenlabsKey.includes('•')) {
-        const tr = await fetch('http://127.0.0.1:8000/settings/test-key', {
+        const tr = await fetch(`${backendHttpUrl}/settings/test-key`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ elevenlabs_key: elevenlabsKey }),
         });
-        if (!tr.ok) { const e = await tr.json(); throw new Error(e.detail || 'Invalid ElevenLabs key'); }
+        await requireOk(tr, 'Invalid ElevenLabs key');
       }
       
       setElevenlabsStatus('saving');
@@ -141,11 +246,11 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
         payload.elevenlabs_key = elevenlabsKey;
       }
       
-      const sr = await fetch('http://127.0.0.1:8000/settings/keys', {
+      const sr = await fetch(`${backendHttpUrl}/settings/keys`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      if (!sr.ok) throw new Error('Failed to save ElevenLabs keys');
+      await requireOk(sr, 'Failed to save ElevenLabs keys');
       
       setElevenlabsStatus('success'); setElevenlabsConfigured(true);
       if (!elevenlabsKey.includes('•')) {
@@ -156,28 +261,38 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
   };
 
   const changePrimaryProvider = async (provider: string) => {
+    const previousProvider = ttsPrimaryProvider;
     setTtsPrimaryProvider(provider);
     try {
-      await fetch('http://127.0.0.1:8000/settings/keys', {
+      const response = await fetch(`${backendHttpUrl}/settings/keys`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tts_primary_provider: provider })
       });
+      await requireOk(response, 'Failed to save primary TTS provider');
     } catch (e) {
+      setTtsPrimaryProvider(previousProvider);
       console.error("Failed to save primary TTS provider:", e);
     }
   };
 
   const togglePermission = async (key: keyof typeof perms) => {
-    const newVal = !perms[key];
+    const previousValue = perms[key];
+    const newVal = !previousValue;
+    setPermissionError('');
     setPerms(prev => ({ ...prev, [key]: newVal }));
     try {
-      await fetch('http://127.0.0.1:8000/settings/permissions', {
+      const response = await fetch(`${backendHttpUrl}/settings/permissions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ [key]: newVal })
       });
-    } catch (e) {
+      await requireOk(response, 'Failed to save permission');
+    } catch (e: any) {
+      setPerms(prev => (
+        prev[key] === newVal ? { ...prev, [key]: previousValue } : prev
+      ));
+      setPermissionError(e?.message || 'Failed to save permission');
       console.error("Failed to save permission:", e);
     }
   };
@@ -189,7 +304,7 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
       if (telegramToken && !telegramToken.includes('•')) {
         payload.bot_token = telegramToken;
       }
-      const r = await fetch('http://127.0.0.1:8000/settings/telegram', {
+      const r = await fetch(`${backendHttpUrl}/settings/telegram`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
@@ -199,7 +314,7 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
         setTelegramConfigured(true);
       }
       // Refresh pairing code / status
-      const res = await fetch('http://127.0.0.1:8000/settings/telegram');
+      const res = await fetch(`${backendHttpUrl}/settings/telegram`);
       const data = await res.json();
       setTelegramPaired(!!data.paired);
       setTelegramChatId(data.chat_id || '');
@@ -210,9 +325,9 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
 
   const resetTelegramPairing = async () => {
     try {
-      const r = await fetch('http://127.0.0.1:8000/settings/telegram/reset', { method: 'POST' });
+      const r = await fetch(`${backendHttpUrl}/settings/telegram/reset`, { method: 'POST' });
       if (!r.ok) throw new Error('Failed to reset pairing');
-      const res = await fetch('http://127.0.0.1:8000/settings/telegram');
+      const res = await fetch(`${backendHttpUrl}/settings/telegram`);
       const data = await res.json();
       setTelegramPaired(false);
       setTelegramChatId('');
@@ -260,14 +375,44 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
           {activeTab === 'providers' && (
             <div className="space-y-5 mt-1">
               <div>
-                <h3 className="text-white font-semibold text-sm mb-0.5">Google Gemini</h3>
+                <h3 className="text-white font-semibold text-sm mb-0.5">Brain Provider</h3>
                 <p className="text-slate-400 text-xs mb-2">Maya's brain — required for conversations.</p>
+                <label className="block text-[11px] font-semibold text-slate-400 mb-1">Provider</label>
+                <select value={geminiProvider} onChange={e => changeBrainProvider(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700/80 text-white text-sm rounded-xl px-3 py-2.5 mb-3 focus:outline-none focus:ring-1 focus:ring-violet-500 transition-all cursor-pointer">
+                  {providerOptions.map(provider => (
+                    <option key={provider.id} value={provider.id}>{provider.label}</option>
+                  ))}
+                </select>
+                <label className="block text-[11px] font-semibold text-slate-400 mb-1">API Key</label>
                 <KeyInputField value={geminiKey} onChange={setGeminiKey}
                   show={showGemini} onToggleShow={() => setShowGemini(v => !v)}
-                  placeholder="AIzaSy..." configured={geminiConfigured} />
+                  placeholder={keyPlaceholderForProvider(geminiProvider)} configured={geminiConfigured} />
+                {providerRequiresBaseUrl && (
+                  <>
+                    <label className="block text-[11px] font-semibold text-slate-400 mt-3 mb-1">Base URL</label>
+                    <input
+                      type="text"
+                      value={geminiBaseUrl}
+                      onChange={e => setGeminiBaseUrl(e.target.value)}
+                      placeholder={geminiProvider === 'cloudflare'
+                        ? 'https://api.cloudflare.com/client/v4/accounts/<account_id>/ai'
+                        : 'https://api.example.com'}
+                      className="w-full bg-slate-950 border border-slate-700 text-white text-sm rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-violet-500 placeholder:text-slate-700"
+                    />
+                  </>
+                )}
+                <label className="block text-[11px] font-semibold text-slate-400 mt-3 mb-1">Active model</label>
+                <input
+                  type="text"
+                  value={activeModel}
+                  onChange={e => setActiveModel(e.target.value)}
+                  placeholder={defaultModelForProvider(geminiProvider)}
+                  className="w-full bg-slate-950 border border-slate-700 text-white text-sm rounded-lg px-3 py-2 focus:outline-none focus:ring-1 focus:ring-violet-500 placeholder:text-slate-700"
+                />
                 <div className="flex items-center gap-3 mt-2">
                   <ActionButton onClick={saveGeminiKey} status={geminiStatus}
-                    idleLabel="Test & Save" loadingLabel={geminiStatus === 'testing' ? 'Testing...' : 'Saving...'} />
+                    idleLabel="Save Brain" loadingLabel={geminiStatus === 'testing' ? 'Testing...' : 'Saving...'} />
                   <StatusText status={geminiStatus} error={geminiError} />
                 </div>
               </div>
@@ -283,6 +428,7 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
                 <p className="text-slate-400 text-xs mb-2">Choose the active engine for Maya's speech output.</p>
                 <select value={ttsPrimaryProvider} onChange={e => changePrimaryProvider(e.target.value)}
                   className="w-full bg-slate-950 border border-slate-700/80 text-white text-sm rounded-xl px-3 py-2.5 focus:outline-none focus:ring-1 focus:ring-violet-500 transition-all cursor-pointer">
+                  <option value="gemini">Gemini Native Audio (Uses same free Gemini key)</option>
                   <option value="edge">Microsoft Edge TTS (Free, Fast, Built-in)</option>
                   <option value="elevenlabs">ElevenLabs / cvoice.ai (Cloud Clone Voice)</option>
                   <option value="gpt_sovits">GPT-SoVITS (Local Offline Clone Voice)</option>
@@ -358,6 +504,12 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
                 <h3 className="text-white font-semibold text-sm">System Access Control</h3>
                 <p className="text-slate-400 text-xs mb-3">Enable or disable advanced capabilities. Red options give Maya full OS control.</p>
               </div>
+
+              {permissionError && (
+                <p className="text-red-400 text-xs flex items-center gap-2" role="alert">
+                  <XCircle size={13} /> {permissionError}
+                </p>
+              )}
 
               <PermissionToggle 
                 label="Web & Browser Automation" 

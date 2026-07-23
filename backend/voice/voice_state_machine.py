@@ -13,6 +13,7 @@ Responsibilities:
 
 import asyncio
 import logging
+import os
 import time
 from collections import deque
 from enum import Enum, auto
@@ -38,7 +39,9 @@ _TRANSITIONS: dict[VoiceState, set[VoiceState]] = {
     VoiceState.IDLE:         {VoiceState.LISTENING},
     VoiceState.LISTENING:    {VoiceState.IDLE, VoiceState.TRANSCRIBING},
     VoiceState.TRANSCRIBING: {VoiceState.THINKING, VoiceState.INTERRUPTED, VoiceState.LISTENING},
-    VoiceState.THINKING:     {VoiceState.SPEAKING, VoiceState.INTERRUPTED},
+    # Allow LISTENING + IDLE from THINKING so that a pipeline error (LLM timeout,
+    # API failure, etc.) can be recovered without permanently locking the engine.
+    VoiceState.THINKING:     {VoiceState.SPEAKING, VoiceState.INTERRUPTED, VoiceState.LISTENING, VoiceState.IDLE},
     VoiceState.SPEAKING:     {VoiceState.LISTENING, VoiceState.INTERRUPTED},
     VoiceState.INTERRUPTED:  {VoiceState.IDLE, VoiceState.LISTENING},
 }
@@ -154,6 +157,32 @@ class VoiceStateMachine:
     async def dequeue_audio(self) -> str:
         """Block until an audio path is available."""
         return await self._audio_queue.get()
+
+    def discard_queued_audio(self) -> int:
+        """Drop pending voice commands when a remote channel owns the turn."""
+        discarded = 0
+        while True:
+            try:
+                audio_path = self._audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            try:
+                if audio_path and os.path.exists(audio_path):
+                    os.remove(audio_path)
+            except OSError:
+                logger.debug(
+                    "[VoiceStateMachine] Could not remove discarded audio %r.",
+                    audio_path,
+                )
+            finally:
+                self._audio_queue.task_done()
+                discarded += 1
+        if discarded:
+            logger.info(
+                "[VoiceStateMachine] Discarded %d queued voice command(s).",
+                discarded,
+            )
+        return discarded
 
     # ── LLM Cancellation ────────────────────────────────────────────────────────
 

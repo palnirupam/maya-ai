@@ -116,10 +116,17 @@ class DesktopMicrophoneListener:
         self._audio_buffer: list[np.ndarray] = []
         # ── Sleep / Lock mode ────────────────────────────────────────────────────
         self._is_locked: bool = False
+        # Separate temporary remote suppression from the user's persistent lock.
+        self._remote_suppression_count: int = 0
 
     @property
     def is_locked(self) -> bool:
         """True when microphone is in sleep/lock mode."""
+        return self._is_locked or self._remote_suppression_count > 0
+
+    @property
+    def is_manually_locked(self) -> bool:
+        """True only when the user explicitly locked the microphone."""
         return self._is_locked
 
     def lock(self) -> None:
@@ -131,6 +138,22 @@ class DesktopMicrophoneListener:
         """Wake microphone from sleep mode — resume speech processing."""
         self._is_locked = False
         logger.info("[DesktopListener] 🔓 Microphone UNLOCKED (Sleep Mode OFF).")
+
+    def suppress_remote_input(self) -> None:
+        """Temporarily ignore speech while a remote command is running."""
+        self._remote_suppression_count += 1
+        logger.info(
+            "[DesktopListener] Remote input suppression ON (count=%d).",
+            self._remote_suppression_count,
+        )
+
+    def resume_remote_input(self) -> None:
+        """Release one remote-command microphone suppression lease."""
+        self._remote_suppression_count = max(0, self._remote_suppression_count - 1)
+        logger.info(
+            "[DesktopListener] Remote input suppression count=%d.",
+            self._remote_suppression_count,
+        )
 
     # ── Startup ─────────────────────────────────────────────────────────────────
 
@@ -278,8 +301,12 @@ class DesktopMicrophoneListener:
                 chunk = data[:, 0] if data.ndim > 1 else data  # 1D float32
 
                 # ── Sleep / Lock mode — drain audio but do nothing ─────────────
-                if self._is_locked:
+                if self.is_locked:
                     vad_accumulator.clear()
+                    pre_buffer.clear()
+                    in_speech = False
+                    silence_count = 0
+                    speech_chunks = []
                     continue
 
                 # ── Barge-in check ─────────────────────────────────────────────

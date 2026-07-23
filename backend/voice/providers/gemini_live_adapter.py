@@ -22,11 +22,13 @@ logger = logging.getLogger(__name__)
 
 # Gemini REST endpoint for Native Audio TTS
 # NOTE: gemini-2.0-flash does NOT support audio responseModalities.
-# The dedicated TTS model is gemini-2.5-flash-preview-tts.
-_GEMINI_TTS_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.5-flash-preview-tts:generateContent"
+# Latest-first Gemini TTS models. Keep the 2.5 fallback because preview model
+# availability can differ across free accounts and regions.
+_GEMINI_TTS_MODELS = (
+    "gemini-3.1-flash-tts-preview",
+    "gemini-2.5-flash-preview-tts",
 )
+_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 # Female voices (recommended)
 # Leda  — calm, sweet, elegant        ← default
@@ -46,6 +48,7 @@ _SYSTEM_INSTRUCTION = (
 
 def _get_api_key() -> Optional[str]:
     """Fetch the Gemini API key — tries DB first, then environment variable."""
+    key = None
     for module_prefix in ("backend.database", "database"):
         try:
             conn_mod = __import__(f"{module_prefix}.connection", fromlist=["SessionLocal"])
@@ -57,12 +60,21 @@ def _get_api_key() -> Optional[str]:
                     model_mod.UserPreferences.key == "GEMINI_API_KEY"
                 ).first()
                 if pref and pref.value:
-                    return crypto_mod.crypto_manager.decrypt(pref.value).strip()
+                    key = crypto_mod.crypto_manager.decrypt(pref.value).strip()
+                    break
             finally:
                 db.close()
         except Exception:
             continue
-    return os.getenv("GEMINI_API_KEY")
+    if not key:
+        key = os.getenv("GEMINI_API_KEY")
+
+    if key:
+        key_lower = key.lower()
+        if any(key_lower.startswith(prefix) for prefix in ("gsk_", "sk-", "nvapi-", "sk-or-")):
+            logger.debug(f"[GeminiTTS] API Key appears to be for another provider ({key[:4]}...) — bypassing Gemini TTS.")
+            return None
+    return key
 
 
 def _get_voice_name() -> str:
@@ -137,53 +149,55 @@ class GeminiLiveAdapter:
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    _GEMINI_TTS_URL,
-                    params={"key": api_key},
-                    json=payload,
-                )
-
-                if response.status_code != 200:
-                    logger.error(
-                        f"[GeminiTTS] API error {response.status_code}: {response.text[:300]}"
+                for model_name in _GEMINI_TTS_MODELS:
+                    response = await client.post(
+                        f"{_GEMINI_TTS_BASE_URL}/{model_name}:generateContent",
+                        params={"key": api_key},
+                        json=payload,
                     )
-                    return
 
-                data = response.json()
+                    if response.status_code != 200:
+                        logger.warning(
+                            f"[GeminiTTS] {model_name} API error {response.status_code}: {response.text[:300]}"
+                        )
+                        continue
 
-                # Extract base64-encoded audio from response
-                try:
-                    inline_data = (
-                        data["candidates"][0]["content"]["parts"][0]["inlineData"]
-                    )
-                    audio_b64: str = inline_data["data"]
-                    raw_pcm_bytes = base64.b64decode(audio_b64)
-                    
-                    # Convert raw PCM16 24kHz to WAV
-                    import wave
-                    import io
-                    with io.BytesIO() as wav_io:
-                        with wave.open(wav_io, 'wb') as wav_file:
-                            wav_file.setnchannels(1)
-                            wav_file.setsampwidth(2) # 16-bit
-                            wav_file.setframerate(24000)
-                            wav_file.writeframes(raw_pcm_bytes)
-                        audio_bytes = wav_io.getvalue()
+                    data = response.json()
 
-                except (KeyError, IndexError, ValueError) as e:
-                    logger.error(f"[GeminiTTS] Failed to extract audio from response: {e}")
-                    logger.debug(f"[GeminiTTS] Response keys: {list(data.keys())}")
-                    return
+                    # Extract base64-encoded audio from response
+                    try:
+                        inline_data = (
+                            data["candidates"][0]["content"]["parts"][0]["inlineData"]
+                        )
+                        audio_b64: str = inline_data["data"]
+                        raw_pcm_bytes = base64.b64decode(audio_b64)
 
-                logger.info(
+                        # Convert raw PCM16 24kHz to WAV
+                        import wave
+                        import io
+                        with io.BytesIO() as wav_io:
+                            with wave.open(wav_io, 'wb') as wav_file:
+                                wav_file.setnchannels(1)
+                                wav_file.setsampwidth(2) # 16-bit
+                                wav_file.setframerate(24000)
+                                wav_file.writeframes(raw_pcm_bytes)
+                            audio_bytes = wav_io.getvalue()
+
+                    except (KeyError, IndexError, ValueError) as e:
+                        logger.error(f"[GeminiTTS] Failed to extract audio from {model_name} response: {e}")
+                        logger.debug(f"[GeminiTTS] Response keys: {list(data.keys())}")
+                        continue
+
+                    logger.info(
                     f"[GeminiTTS] ✅ Generated {len(audio_bytes)} bytes "
-                    f"(voice={voice_name}, emotion={emotion}, lang={language})"
-                )
+                        f"(model={model_name}, voice={voice_name}, emotion={emotion}, lang={language})"
+                    )
 
-                # Yield in chunks matching the existing pipeline's chunk size
-                chunk_size = 4096
-                for i in range(0, len(audio_bytes), chunk_size):
-                    yield audio_bytes[i : i + chunk_size]
+                    # Yield in chunks matching the existing pipeline's chunk size
+                    chunk_size = 4096
+                    for i in range(0, len(audio_bytes), chunk_size):
+                        yield audio_bytes[i : i + chunk_size]
+                    return
 
         except httpx.TimeoutException:
             logger.warning("[GeminiTTS] Request timed out — falling back to Edge TTS.")

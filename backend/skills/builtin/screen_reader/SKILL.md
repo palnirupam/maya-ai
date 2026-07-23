@@ -64,4 +64,4 @@ If the user wants Maya to fix or click something based on what's visible:
 
 **Code editor visible:**
 - Identify the file, language, and line number of the error if any.
-- Offer to fix it using `read_file()` + `create_file()`.
+- Offer to fix it using `file(action="read", ...)` + `file(action="write", ...)`.

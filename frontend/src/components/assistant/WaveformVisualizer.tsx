@@ -6,8 +6,8 @@
  * During Maya's speaking state the bars glow in the theme color.
  */
 
-import React, { useEffect, useRef } from 'react';
-import { motion, useAnimationControls } from 'framer-motion';
+import React from 'react';
+import { motion } from 'framer-motion';
 import type { SessionState } from '../../hooks/useVoiceSession';
 
 interface WaveformVisualizerProps {

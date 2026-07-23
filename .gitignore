@@ -65,6 +65,7 @@ dist/
 build/
 *.egg-info/
 scratch/
+.test-runtime/
 
 # Database & Data
 data/
@@ -85,9 +86,17 @@ whatsapp_auth/
 Thumbs.db
 
 # Maya Runtime Data & Privacy
+backend/state/
 backend/data/browser_state.json
 backend/data/screenshots/
 backend/data/youtube_player.pid
+/archive/
+
+
+# Other
+maya_reference.mp3
+test_*.mp3
+transcript.txt
 
 
 # Other
@@ -103,3 +112,5 @@ backend/voice/gpt_sovits_core/GPT_SoVITS/pretrained_models/
 # MCP Servers (Contains API Keys)
 backend/config/mcp_servers.json
 *.pid
+.claude/
+.coverage

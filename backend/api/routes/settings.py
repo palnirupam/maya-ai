@@ -1,20 +1,139 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+import os
 from ...database.connection import get_db
 from ...database.models import UserPreferences
 from ...database.crypto import crypto_manager
+from ...database.preferences import (
+    decrypt_pref_value as _decrypt_stored_pref,
+    read_permission_pref,
+)
+from ...config.model_config import get_model
+from ...config.provider_config import (
+    ANTHROPIC_KIND,
+    OPENAI_COMPATIBLE_KIND,
+    base_url_from_env,
+    chat_url_for_provider,
+    detect_provider_from_key,
+    model_from_env,
+    model_for_provider,
+    normalize_provider,
+    provider_options,
+    provider_from_env,
+    provider_spec,
+)
 import logging
 import httpx
-import os
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/settings", tags=["settings"])
+
+def _model_for_provider(provider: str, stored_model: str | None) -> str:
+    return model_for_provider(provider, stored_model, get_model)
+
+
+def _decrypt_pref_value(pref) -> str:
+    return _decrypt_stored_pref(pref)
+
+
+def _provider_headers(provider: str, api_key: str) -> dict[str, str]:
+    spec = provider_spec(provider)
+    if spec.kind == ANTHROPIC_KIND:
+        return {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if normalize_provider(provider) == "openrouter":
+        headers["HTTP-Referer"] = "http://localhost:1420"
+        headers["X-Title"] = "Maya AI"
+    return headers
+
+
+def _validate_provider_key(provider: str, api_key: str, base_url: str | None, model: str | None) -> dict:
+    provider = normalize_provider(provider)
+    spec = provider_spec(provider)
+    active_model = _model_for_provider(provider, model)
+
+    if spec.kind == ANTHROPIC_KIND:
+        payload_data = {
+            "model": active_model,
+            "messages": [{"role": "user", "content": "Ping"}],
+            "max_tokens": 5,
+        }
+        response = httpx.post(spec.api_url, headers=_provider_headers(provider, api_key), json=payload_data, timeout=10.0)
+        response.raise_for_status()
+        return {"status": "success", "message": f"{spec.label} key is valid.", "provider": provider}
+
+    if spec.kind == OPENAI_COMPATIBLE_KIND:
+        if spec.models_url:
+            response = httpx.get(spec.models_url, headers=_provider_headers(provider, api_key), timeout=10.0)
+            response.raise_for_status()
+            return {"status": "success", "message": f"{spec.label} key is valid.", "provider": provider}
+
+        chat_url = chat_url_for_provider(provider, base_url)
+        if not chat_url:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{spec.label} requires a base URL. For Cloudflare use https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai",
+            )
+        payload_data = {
+            "model": active_model,
+            "messages": [{"role": "user", "content": "Ping"}],
+            "max_tokens": 5,
+        }
+        response = httpx.post(chat_url, headers=_provider_headers(provider, api_key), json=payload_data, timeout=10.0)
+        response.raise_for_status()
+        return {"status": "success", "message": f"{spec.label} key is valid.", "provider": provider}
+
+    # Native Google Gemini key.
+    from google import genai
+
+    client = genai.Client(api_key=api_key)
+    models_to_try = [
+        active_model,
+        'gemini-3.5-flash',
+        'gemini-3.1-flash-lite',
+        'gemini-2.5-flash-lite',
+        'gemini-2.5-flash',
+        'gemini-2.0-flash',
+        'gemini-1.5-flash',
+    ]
+    seen = set()
+    last_error = None
+    for model_name in models_to_try:
+        if not model_name or model_name in seen:
+            continue
+        seen.add(model_name)
+        try:
+            response = client.models.generate_content(model=model_name, contents='Ping')
+            if response and response.text:
+                logger.info(f"Successfully validated key using model: {model_name}")
+                return {"status": "success", "message": "Key is valid and active.", "provider": "gemini"}
+        except Exception as e:
+            logger.warning(
+                "Key validation failed for model %s (%s).",
+                model_name,
+                type(e).__name__,
+            )
+            last_error = e
+
+    if last_error:
+        raise last_error
+    raise Exception("Failed to generate content with any model.")
 
 
 class KeysPayload(BaseModel):
     gemini_key: str | None = None
     provider: str | None = None
+    base_url: str | None = None
+    active_model: str | None = None
     elevenlabs_key: str | None = None
     elevenlabs_voice_id: str | None = None
     elevenlabs_model_id: str | None = None
@@ -48,20 +167,36 @@ def get_status(db: Session = Depends(get_db)):
     elevenlabs_pref = db.query(UserPreferences).filter(UserPreferences.key == "ELEVENLABS_API_KEY").first()
     voice_pref = db.query(UserPreferences).filter(UserPreferences.key == "ELEVENLABS_VOICE_ID").first()
     model_pref = db.query(UserPreferences).filter(UserPreferences.key == "ELEVENLABS_MODEL_ID").first()
+    active_model_pref = db.query(UserPreferences).filter(UserPreferences.key == "GEMINI_ACTIVE_MODEL").first()
+    provider_pref = db.query(UserPreferences).filter(UserPreferences.key == "GEMINI_API_PROVIDER").first()
+    base_url_pref = db.query(UserPreferences).filter(UserPreferences.key == "GEMINI_API_BASE_URL").first()
 
-    voice_id = ""
-    if voice_pref and voice_pref.value:
+    voice_id = _decrypt_pref_value(voice_pref)
+    model_id = _decrypt_pref_value(model_pref)
+    active_model = _decrypt_pref_value(active_model_pref)
+    raw_provider = _decrypt_pref_value(provider_pref)
+    provider = normalize_provider(raw_provider) if raw_provider else ""
+    base_url = _decrypt_pref_value(base_url_pref)
+    env_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    env_provider = provider_from_env()
+    env_model = model_from_env()
+    env_base_url = base_url_from_env()
+
+    if env_provider:
+        provider = env_provider
+    elif not provider and gemini_pref and gemini_pref.value:
         try:
-            voice_id = crypto_manager.decrypt(voice_pref.value)
+            key_hint = crypto_manager.decrypt(gemini_pref.value).strip()
+            if key_hint:
+                provider = detect_provider_from_key(key_hint)
         except:
             pass
-
-    model_id = ""
-    if model_pref and model_pref.value:
-        try:
-            model_id = crypto_manager.decrypt(model_pref.value)
-        except:
-            pass
+    if not provider and env_key:
+        provider = detect_provider_from_key(env_key)
+    if not provider:
+        provider = "gemini"
+    active_model = _model_for_provider(provider, env_model or (None if env_provider else active_model))
+    base_url = env_base_url or base_url
 
     # Retrieve active primary voice provider
     tts_provider_pref = db.query(UserPreferences).filter(UserPreferences.key == "TTS_PRIMARY_PROVIDER").first()
@@ -72,34 +207,26 @@ def get_status(db: Session = Depends(get_db)):
         except:
             pass
     if not tts_primary_provider:
-        if elevenlabs_pref and elevenlabs_pref.value:
-            tts_primary_provider = "elevenlabs"
-        else:
-            tts_primary_provider = "edge"
+        tts_primary_provider = "gemini"
 
     # Permissions
-    def _is_enabled(k: str) -> bool:
-        p = db.query(UserPreferences).filter(UserPreferences.key == k).first()
-        if p and p.value:
-            try:
-                return crypto_manager.decrypt(p.value) == "true"
-            except:
-                pass
-        return False
-
     return {
-        "gemini_configured": bool(gemini_pref and gemini_pref.value),
+        "gemini_configured": bool((gemini_pref and gemini_pref.value) or env_key),
+        "gemini_provider": provider,
+        "gemini_active_model": active_model,
+        "gemini_base_url": base_url,
+        "provider_options": provider_options(get_model),
         "elevenlabs_configured": bool(elevenlabs_pref and elevenlabs_pref.value),
         "elevenlabs_voice_id": voice_id,
         "elevenlabs_model_id": model_id,
         "tts_primary_provider": tts_primary_provider,
         "permissions": {
-            "browser": _is_enabled("PERM_BROWSER"),
-            "filesystem": _is_enabled("PERM_FILESYSTEM"),
-            "terminal": _is_enabled("PERM_TERMINAL"),
-            "system": _is_enabled("PERM_SYSTEM"),
-            "auto_approve": _is_enabled("PERM_AUTO_APPROVE"),
-            "web_search": _is_enabled("PERM_WEB_SEARCH"),
+            "browser": read_permission_pref(db, "PERM_BROWSER"),
+            "filesystem": read_permission_pref(db, "PERM_FILESYSTEM"),
+            "terminal": read_permission_pref(db, "PERM_TERMINAL"),
+            "system": read_permission_pref(db, "PERM_SYSTEM"),
+            "auto_approve": read_permission_pref(db, "PERM_AUTO_APPROVE"),
+            "web_search": read_permission_pref(db, "PERM_WEB_SEARCH"),
         }
     }
 
@@ -121,8 +248,11 @@ def test_gemini_key(payload: KeysPayload):
                 response.raise_for_status()
                 return {"status": "success", "message": "cvoice.ai Key is valid.", "provider": "cvoice"}
             except Exception as e:
-                logger.error(f"cvoice.ai validation failed: {e}")
-                raise HTTPException(status_code=401, detail=f"Validation failed for cvoice.ai key: {e}")
+                logger.warning("cvoice.ai validation failed (%s).", type(e).__name__)
+                raise HTTPException(
+                    status_code=401,
+                    detail="cvoice.ai key validation failed. Check the key and try again.",
+                )
                 
         # ElevenLabs Validation
         url = "https://api.elevenlabs.io/v1/voices"
@@ -134,132 +264,37 @@ def test_gemini_key(payload: KeysPayload):
             response.raise_for_status()
             return {"status": "success", "message": "ElevenLabs Key is valid.", "provider": "elevenlabs"}
         except Exception as e:
-            logger.error(f"ElevenLabs validation failed: {e}")
-            raise HTTPException(status_code=401, detail=f"Validation failed for ElevenLabs key: {e}")
+            logger.warning("ElevenLabs validation failed (%s).", type(e).__name__)
+            raise HTTPException(
+                status_code=401,
+                detail="ElevenLabs key validation failed. Check the key and try again.",
+            )
 
     if not payload.gemini_key:
         raise HTTPException(status_code=400, detail="Key required")
     clean_key = payload.gemini_key.strip()
-    
-    # 1. OpenRouter
-    if clean_key.startswith("sk-or-"):
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {clean_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "http://localhost:1420",
-            "X-Title": "Maya AI"
-        }
-        payload_data = {
-            "model": "google/gemini-2.5-flash",
-            "messages": [{"role": "user", "content": "Ping"}],
-            "max_tokens": 5
-        }
-        try:
-            response = httpx.post(url, headers=headers, json=payload_data, timeout=10.0)
-            response.raise_for_status()
-            return {"status": "success", "message": "OpenRouter Key is valid and active.", "provider": "openrouter"}
-        except Exception as e:
-            logger.error(f"OpenRouter validation failed: {e}")
-            raise HTTPException(status_code=401, detail=f"Validation failed for OpenRouter key: {e}")
-            
-    # 2. NVIDIA NIM
-    elif clean_key.startswith("nvapi-"):
-        url = "https://integrate.api.nvidia.com/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {clean_key}",
-            "Content-Type": "application/json"
-        }
-        payload_data = {
-            "model": "meta/llama-3.1-8b-instruct",
-            "messages": [{"role": "user", "content": "Ping"}],
-            "max_tokens": 5
-        }
-        try:
-            response = httpx.post(url, headers=headers, json=payload_data, timeout=10.0)
-            response.raise_for_status()
-            return {"status": "success", "message": "NVIDIA NIM Key is valid and active.", "provider": "nvidia"}
-        except Exception as e:
-            logger.error(f"NVIDIA NIM validation failed: {e}")
-            raise HTTPException(status_code=401, detail=f"Validation failed for NVIDIA NIM key: {e}")
-            
-    # 3 & 4. OpenCode Zen or OpenAI
-    elif clean_key.startswith("sk-"):
-        # Let's try both endpoints to see which one accepts this key.
-        # We determine the order of trying based on key length (OpenCode Zen is typically 67 chars).
-        is_likely_zen = (len(clean_key) == 67)
-        errors = []
-        
-        def try_zen():
-            url = "https://opencode.ai/zen/v1/models"
-            headers = {
-                "Authorization": f"Bearer {clean_key}",
-                "Content-Type": "application/json"
-            }
-            res = httpx.get(url, headers=headers, timeout=10.0)
-            res.raise_for_status()
-            return {"status": "success", "message": "OpenCode Zen Key is valid and active.", "provider": "opencode_zen"}
+    provider = detect_provider_from_key(clean_key, payload.provider)
 
-        def try_openai():
-            url = "https://api.openai.com/v1/models"
-            headers = {
-                "Authorization": f"Bearer {clean_key}",
-                "Content-Type": "application/json"
-            }
-            res = httpx.get(url, headers=headers, timeout=10.0)
-            res.raise_for_status()
-            return {"status": "success", "message": "OpenAI Key is valid and active.", "provider": "openai"}
-
-        order = [try_zen, try_openai] if is_likely_zen else [try_openai, try_zen]
-        
-        for func in order:
-            try:
-                return func()
-            except Exception as e:
-                errors.append(f"{func.__name__} failed: {e}")
-                
-        # If both failed
-        logger.error(f"Validation failed for sk- key: {errors}")
-        raise HTTPException(status_code=401, detail=f"Validation failed for sk- key: {'; '.join(errors)}")
-            
-    # 5. Native Google Gemini Key
-    else:
-        try:
-            from google import genai
-            client = genai.Client(api_key=clean_key)
-            models_to_try = [
-                'gemini-3.5-flash',
-                'gemini-2.5-flash',
-                'gemini-3.1-flash-lite',
-                'gemini-1.5-flash'
-            ]
-            response = None
-            last_error = None
-            for model in models_to_try:
-                try:
-                    response = client.models.generate_content(
-                        model=model,
-                        contents='Ping'
-                    )
-                    if response and response.text:
-                        logger.info(f"Successfully validated key using model: {model}")
-                        break
-                except Exception as e:
-                    logger.warning(f"Failed key validation with model {model}: {e}")
-                    last_error = e
-            
-            if response and response.text:
-                return {"status": "success", "message": "Key is valid and active.", "provider": "gemini"}
-            
-            if last_error:
-                raise last_error
-            raise Exception("Failed to generate content with any model.")
-        except Exception as e:
-            logger.error(f"Key validation failed: {e}")
-            err_msg = str(e)
-            if "API key expired" in err_msg or "400" in err_msg:
-                err_msg = "API key expired. Please renew/regenerate your API key on Google AI Studio."
-            raise HTTPException(status_code=401, detail=f"Validation failed: {err_msg}")
+    try:
+        return _validate_provider_key(provider, clean_key, payload.base_url, payload.active_model)
+    except HTTPException:
+        raise
+    except Exception as e:
+        spec = provider_spec(provider)
+        logger.warning("%s validation failed (%s).", spec.label, type(e).__name__)
+        err_msg = str(e)
+        if provider == "gemini" and ("API key expired" in err_msg or "400" in err_msg):
+            detail = "API key expired. Please renew/regenerate your API key on Google AI Studio."
+        elif isinstance(e, httpx.TimeoutException):
+            detail = f"{spec.label} validation timed out. Please try again."
+        elif isinstance(e, httpx.HTTPStatusError):
+            detail = (
+                f"{spec.label} rejected the validation request "
+                f"(HTTP {e.response.status_code})."
+            )
+        else:
+            detail = f"{spec.label} key validation failed. Check the provider settings and try again."
+        raise HTTPException(status_code=401, detail=detail)
 
 
 # ── Save Keys ─────────────────────────────────────────────────────────────────
@@ -281,24 +316,26 @@ def _reload_adapters():
 @router.post("/keys")
 def save_keys(payload: KeysPayload, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """Encrypts and saves API keys. Reloads adapters immediately in background."""
+    provider = normalize_provider(payload.provider) if payload.provider else ""
+
     if payload.gemini_key:
         key = payload.gemini_key.strip()
         _save_pref(db, "GEMINI_API_KEY", key)
-        
-        provider = payload.provider
-        if not provider:
-            if key.startswith("sk-or-"):
-                provider = "openrouter"
-            elif key.startswith("nvapi-"):
-                provider = "nvidia"
-            elif key.startswith("sk-"):
-                if len(key) == 67:
-                    provider = "opencode_zen"
-                else:
-                    provider = "openai"
-            else:
-                provider = "gemini"
+        provider = detect_provider_from_key(key, provider)
         _save_pref(db, "GEMINI_API_PROVIDER", provider)
+    elif payload.provider is not None:
+        _save_pref(db, "GEMINI_API_PROVIDER", provider)
+
+    if payload.base_url is not None:
+        _save_pref(db, "GEMINI_API_BASE_URL", payload.base_url.strip())
+
+    if payload.active_model is not None:
+        if not provider:
+            provider_pref = db.query(UserPreferences).filter(UserPreferences.key == "GEMINI_API_PROVIDER").first()
+            raw_provider = _decrypt_pref_value(provider_pref)
+            provider = normalize_provider(raw_provider) if raw_provider else "gemini"
+        provider = provider or "gemini"
+        _save_pref(db, "GEMINI_ACTIVE_MODEL", _model_for_provider(provider, payload.active_model))
 
     if payload.elevenlabs_key is not None:
         _save_pref(db, "ELEVENLABS_API_KEY", payload.elevenlabs_key.strip())

@@ -1,161 +1,190 @@
 <div align="center">
-  <h1>✨ Maya AI - The Next Gen Desktop Copilot</h1>
-  <br/>
+  <h1>Maya AI — Desktop Copilot</h1>
   <img src="assets/maya_ai_banner.png" alt="Maya AI Banner" width="800"/>
-  <br/>
-  <p><i>A privacy-first, fully autonomous, and highly emotional AI companion for Windows.</i></p>
+  <p><i>A privacy-first, voice-enabled AI assistant that runs locally on Windows.</i></p>
 </div>
 
 ---
 
-Maya is not just a chatbot—she is a **Context-Aware Desktop Agent** designed to run locally on your PC. Equipped with powerful voice cloning, hybrid vision automation, and enterprise-grade privacy controls, Maya acts as your pair programmer, assistant, and companion.
+Maya is a context-aware desktop agent, not just a chatbot. She runs entirely on your PC, speaks and listens in Bengali, Hindi, and English, controls your desktop and browser, sends WhatsApp messages and emails on your behalf, and remembers you across sessions — all behind hardware-bound encryption and explicit permission gates.
 
-## 🌟 Key Features
+## Table of Contents
 
-### 🗣️ Hybrid Voice Engine (Gemini Native Audio & Fallbacks)
-Maya speaks naturally using state-of-the-art TTS models with smooth transition logic:
-* 🔊 **Gemini Native Audio (Default):** Uses `gemini-2.5-flash-preview-tts` out-of-the-box to generate ultra-realistic, expressive human-like speech.
-* 🎙️ **VAD Pipeline:** Uses Silero VAD + Faster Whisper to transcribe your voice perfectly.
-* 🔄 **Built-in Fallback:** Automatically falls back to Microsoft Edge Neural TTS if the primary engine encounters network lag or rate limits.
-* 🎭 **Voice Cloning Support:** Ready-to-use adapters for local offline **GPT-SoVITS** (requires running a local server on port 9880) and cloud **ElevenLabs / cvoice.ai** for custom voice prints.
+- [Highlights](#highlights)
+- [Feature Overview](#feature-overview)
+- [Architecture](#architecture)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Running](#running)
+- [Extending Maya](#extending-maya)
+- [Security Model](#security-model)
+- [Troubleshooting](#troubleshooting)
 
-### 📱 Remote Mobile Control (Telegram & WhatsApp)
-Maya bridges the gap between your desktop and mobile phone with native integrations.
-* 🤖 **Telegram Remote Control:** Command your laptop from anywhere via a secure Telegram Bot.
-  * ⚠️ **Dangerous Command Guard:** Prompts with interactive Yes/No buttons before executing risky operations like shutting down the PC.
-  * 🚨 **🛑 Emergency Kill Switch:** Features a prominent, red **Emergency Stop** button at the very top of the Telegram bot keyboard! Tapping the button or sending `STOP`, `HALT`, `PANIC` instantly interrupts and kills any running orchestrator task or runaway automation in the backend, ensuring 100% host safety.
-* 💬 **WhatsApp Integration:** 
-  * 📨 **Background Message Reading & Sending:** Maya natively reads recent WhatsApp chats and summarizes them via the background service. You can ask *"Did Pintu send any new messages?"* straight from Telegram without opening your PC.
-  * 🔒 **Zero-Config Auto-Auth Security:** Features an enterprise-grade dynamic token injection. A cryptographically secure 64-character key (`secrets.token_hex`) is generated in memory, securely shared via atomic Temp files (`icacls` restricted), and injected directly into the Node.js subprocess. No `.env` manual setups required—100% robust and hack-proof out of the box!
-* 📬 **Headless Background Emailer:** Send secure emails completely in the background via SMTP (Gmail) using AES encrypted credentials. Fully supports **file attachments** (send any PDF, image, or document from your PC remotely).
-* 🔍 **Recursive PC File Search:** Locates any file on your hard drives in seconds. Highly optimized to skip heavy system/dependency folders (like `AppData`, `node_modules`, `.git`) for fast, crash-free indexing.
-* ⚡ **Lightning Fast Routing:** Optimized Gemini API adapters auto-route between `gemini-3.5-flash` and `gemini-2.5-flash` for sub-3-second mobile replies.
+## Highlights
 
-### 👁️ Context-Aware Vision Architecture
-Maya can see your screen, but **only when you ask her to**. 
-* **Hybrid Automation (3-Tier Strategy):**
-  1. ⚡ **Blind Macros & Shortcuts:** Lightning-fast pre-mapped hotkeys for over 60+ Windows actions (Virtual Desktops, Window Snapping, Brightness Control, Media).
-  2. 🔍 **OCR-Assisted Clicking:** Maya scans the screen locally (using `EasyOCR` + `Pillow`) to find exact words and buttons. She hovers for visual confirmation before clicking!
-  3. 🧠 **Gemini Vision Fallback:** Uses Gemini 1.5 Flash for deep visual reasoning.
-* **App Context System:** Before working in a new app, Maya automatically reads a dedicated JSON knowledge base (`app_contexts/`) to learn the app's specific shortcuts and workflows.
+- **Multilingual by design** — replies in the language you speak (Bengali, Banglish, Hindi, English), in voice and text.
+- **Local-first** — the backend, memory database, and automation stack run on your machine. Cloud calls are limited to the LLM/TTS providers you configure.
+- **Remote control** — drive your PC from your phone through Telegram, with interactive approval buttons and an emergency stop.
+- **WhatsApp automation** — send messages and files by contact name, with fuzzy name resolution and honest disambiguation when multiple contacts match.
+- **Resilient** — multi-provider model fallback with active recovery probing, so a rate limit never takes Maya fully offline.
 
-### 🌐 Advanced Browser & Web Automation
-Maya can natively interact with the web without manual mouse clicking.
-* 🎭 **Playwright Integration:** Native `async` Playwright engine allows Maya to navigate, click, type, and extract structured data from any website programmatically.
-* 🎥 **Google Meet Automation:** Automatically joins Meet calls, grants browser permissions, and configures mic/camera states before joining.
-* 📚 **Google Classroom Automation:** Fetches pending assignments and programmatically uploads & submits files to Classroom.
-* 🎵 **Headless Ad-Free YouTube:** Play background music directly via VLC + yt-dlp without opening a browser or playing a single ad!
+## Feature Overview
 
-### 🧠 Intelligent Multi-Agent System
-Maya operates on a sophisticated **4-Tier Routing Architecture**, ensuring maximum efficiency:
-* **Smart Routing:** Simple chats bypass agents for instant replies, while complex tasks are delegated to specialized agents (Coder, OS Executor, Researcher).
-* **Multi-Provider Fallback Chain:** Never goes offline! Automatically routes requests: `Gemini → OpenRouter → NVIDIA NIM → OpenAI`. If one rate-limits, the next one instantly takes over.
-* **Safety First:** Built-in capability gating (tools are disabled if not explicitly permitted), safety timeouts, and infinite-loop constraints.
+### Voice Engine
 
-### 🛡️ Enterprise-Grade Security & Sandboxing
-Spyware is creepy. Maya is transparent and mathematically secure.
-* **Hardware-Bound AES Encryption:** Your keys and passwords are encrypted using a cryptographic key derived natively from your Motherboard + CPU serial. They cannot be stolen and decrypted on another PC.
-* **AST-Based Skill Sandboxing:** Community plugins and skills are analyzed at the source level. Dangerous imports (`os`, `eval`, `exec`) are strictly blocked before execution.
-* **Cryptographic Integrity:** SHA-256 hash verification ensures loaded plugins haven't been maliciously tampered with.
-* **Sensitive App Auto-Blocker:** If you have Bitwarden, 1Password, or a Bank tab open, Maya physically **blocks the screenshot** to protect your passwords and OTPs.
-* **Visual Overlay Feedback:** A Windows Toast Notification (`👁️ Maya is inspecting Chrome...`) pops up every single time she looks at your screen. You are always in control.
+- **Input:** Silero VAD + faster-whisper transcription, with wake-word support (`openwakeword`).
+- **Output:** Gemini native audio TTS by default, with automatic fallback to Microsoft Edge Neural TTS on network lag or rate limits.
+- **Voice cloning:** optional adapters for local GPT-SoVITS (offline, port 9880) and ElevenLabs.
+- **Bengali phonetics:** dedicated pronunciation rules for natural Bengali speech.
 
-### 💾 3-Layer Encrypted Vector Memory (Semantic Search)
-Maya actually remembers you. 
-* **Tri-Tier Storage:** Contextually divides memory into *Short-term Conversation*, *Emotional State*, and *Long-term Facts*.
-* **Importance-Based Expiry:** Irrelevant details fade away over time, while critical facts are retained forever.
-* **Semantic Vector Search**: Uses Google's state-of-the-art `gemini-embedding-2` model (3072-dimensional vectors) and `numpy` to run local semantic similarity queries, replacing slow keyword-based decryption scans.
-* **Weighted Scoring & Gated Retrieval**: Combines semantic similarity with memory importance using a gating threshold ($similarity \ge 0.30$ or $importance == 5$) and a configurable score threshold ($score \ge 0.45$, where $score = similarity + importance \times 0.05$). This keeps context relevant and compact.
-* **Dynamic Safe Backfilling**: Automatically embeds legacy memories on-the-fly (capped at `5` per query to prevent latency spikes) and persists them in the SQLite database in single-batch commits.
-* **Retrieval Analytics**: Automatically tracks retrieval stats (`retrieval_count` and `last_accessed` time) for candidate ranking.
-* **Security-Fuzzed Database**: Evaluated against threat models including SQL Injection, null-byte input, non-finite vector parameters (NaN/Infinity), corrupted vector JSON, and Unicode/XSS script tag injections to guarantee zero backend crashes.
-* **Secure Storage**: Raw memory content continues to be encrypted in local SQLite using hardware-bound keys (Motherboard + CPU ID), keeping vectors anonymous and secure.
+### WhatsApp Integration
 
-### ⚙️ Advanced Platform Architecture
-Maya has been heavily upgraded to perform as a highly resilient and fault-tolerant agent platform.
-* 🛡️ **Generic Exec Approval & Audit:** Dangerous OS commands are intercepted and sent to an SQLite queue for human approval. Every single tool action is logged with precision in an `audit.jsonl` file.
-* 🛑 **Deep Emergency Stop:** Running a runaway script or infinite loop? Tapping "Emergency Stop" on Telegram doesn't just cancel async tasks; it physically hunts down and kills (`taskkill /F /T`) every child process spawned by the agent to prevent memory leaks.
-* 🔄 **Multi-Provider Auto Fallback & Probing:** If the primary model hits a `429 Rate Limit` or `503 Error`, it shifts to fallback models and starts an active probing loop with exponential backoff (`30s → 60s → 120s → 300s`) to dynamically restore the primary model early upon recovery.
-* 🪝 **Secure Event-Driven Hooks System:** Run custom local scripts on events (like `on_session_start`, `on_sensitive_app_detected`, `on_command_approval_request`). Enforces strict absolute path checks within `hooks/`, execution timeouts, and a concurrency limit of 10 (`asyncio.Semaphore(10)`) to protect against process storms and command injections.
-* 😴 **Dreaming Mode (Memory Compaction):** Every night, a background scheduler wakes up to review your conversations from the past 12 hours. It extracts your core *Preferences, Contacts, and Ongoing Tasks*, encrypts them into Long-Term Memory, and permanently archives the raw logs to save DB space and context window costs.
+Runs as a background Node.js service (`whatsapp-web.js`, port 9001) paired to your phone via a one-time pairing code — no QR scan needed.
 
-### 🎭 Dynamic Contextual Personality
-Maya isn't just a bot, she has highly adaptable modes.
-* **4 Personality Modes:** Seamlessly switch between *Companion*, *Coding*, *Professional*, and *Friendly*.
-* **Religion-Neutral Enforcement:** Strictly enforces unbiased, respectful, and religion-neutral language in all interactions.
-* **Bengali Phonetic TTS:** Specialized linguistic rules mapped for flawless Bengali pronunciation during Text-to-Speech.
-* **Dynamic Prompt Assembly:** System prompts aren't static; they are built on-the-fly based on your current OS context and emotional memory.
+- **Send messages and files by name.** Contact resolution order:
+  1. Maya's own contact database,
+  2. your phone's synced WhatsApp contacts, searched with fuzzy matching (partial names and small typos still match).
+- **Ghost-contact filtering:** WhatsApp's internal LID migration creates duplicate contact entries with non-dialable IDs; these are detected and filtered out automatically.
+- **Honest disambiguation:** if several contacts match, Maya shows you the exact numbered list — rendered deterministically in your language, never paraphrased by the LLM — and waits for your pick.
+- **Incoming messages:** reads and summarizes recent chats, and can notify you (with context) when someone messages you or mentions Maya in a group.
+- **Delivery tracking, revoke ("delete for everyone"), and per-sender block/allow lists.**
+- **Security:** the service is protected by a per-boot 64-character API key generated in memory, shared via an ACL-restricted temp file, and injected into the Node subprocess — no manual key setup.
 
-### 🧩 Hot-Reloadable Plugin & Skill System
-Maya grows with you.
-* **Markdown-Based Skills:** Create custom skills instantly. Maya extends her own capabilities by reading `SKILL.md` files—no complex python boilerplate required!
-* **Hot-Reloading:** Drop a new plugin or skill into the folder, and Maya learns it instantly without needing a server restart.
+### Telegram Remote Control
 
-### 🔌 Universal MCP (Model Context Protocol) Support
-Infinite capabilities without writing custom integrations.
-* **Zero Custom Code:** Connect Maya to GitHub, SQLite, PostgreSQL, Slack, Google Drive, or Knowledge Graphs by simply adding a few lines to `mcp_servers.json`. No Python API integration needed!
-* **Auto-Discovery:** Maya automatically connects to your defined MCP servers (via `stdio` or `sse`), discovers available tools dynamically, and sanitizes schemas to be fully compatible with Gemini.
-* **Robust Concurrency:** Built with enterprise-grade asynchronous lifecycle management. Handles background task isolation, precise lock guards, and jittered exponential backoffs natively to prevent retry storms and deadlock scenarios.
-* **Auto MCP Configurator via Telegram:** No need to edit JSON files manually! Just tell Maya on Telegram: *"Add the YouTube MCP server using @modelcontextprotocol/server-youtube and this API key."* Maya validates the package using strict regex, sanitizes environment variables to prevent RCE/Shell Injection, and safely updates `mcp_servers.json` using atomic file writes (`os.replace`). *(e.g. get your YouTube API v3 Key from the [Google Cloud Console](https://console.cloud.google.com/apis/library/youtube.googleapis.com)).*
+- Command your PC from anywhere via a private Telegram bot.
+- **Approval guard:** risky operations (shutdown, deletions, exec) require an explicit Approve/Deny tap before running.
+- **Emergency stop:** a pinned red button (or sending `STOP` / `HALT` / `PANIC`) interrupts the orchestrator and force-kills every child process spawned by the agent (`taskkill /F /T`).
 
----
+### Desktop & Web Automation
 
-## ⚙️ Initial Setup
+- **Three-tier automation strategy:** pre-mapped hotkeys for 60+ Windows actions → local OCR-assisted clicking (EasyOCR) with hover confirmation → Gemini Vision as the final fallback.
+- **Browser automation:** async Playwright for navigation, form filling, and structured extraction; Google Meet auto-join and Google Classroom assignment submission.
+- **Ad-free background music:** YouTube audio via VLC + yt-dlp, no browser window.
+- **File search:** recursive drive search that skips heavy system folders (`AppData`, `node_modules`, `.git`) for fast results.
+- **Background email:** SMTP (Gmail app password) with AES-encrypted credentials and file attachments.
 
-1. **Clone the Repository**:
-   First, clone the repository to your local machine:
-   ```bash
-   git clone https://github.com/palnirupam/maya-ai.git
-   cd maya-ai
-   ```
+### Multi-Agent Orchestration
 
-2. **API Keys Configuration**:
-   Create a `.env` file in the `backend/` directory and add your keys. *(Get your Gemini API Key for free from [Google AI Studio](https://aistudio.google.com/app/apikey))*
-   ```env
-   GEMINI_API_KEY=your_gemini_api_key_here
-   ELEVENLABS_API_KEY=your_elevenlabs_key_here # Optional
-   ```
+- **Tiered routing:** simple chat bypasses the agent stack entirely; complex tasks route to specialized agents (Coder, OS Executor, Researcher).
+- **Deterministic fast paths:** common OS controls (volume, brightness, app open/close) and clarification replies skip the LLM completely — instant and immune to model quality dips.
+- **Cost-aware model tiering:** each message is scored for complexity and served by the matching Gemini tier, with automatic per-session downgrades on budget overrun.
+- **Provider fallback chain:** Gemini → OpenRouter → NVIDIA NIM → OpenAI, with active recovery probing (exponential backoff: 30s → 60s → 120s → 300s) to restore the primary as soon as it recovers.
 
-3. **📬 Headless Gmail Setup (No Files to Edit!)**:
-   You do **not** need to open any code files or edit `.env` to set up your email! Maya is fully conversational.
-   * **Step 1:** Turn on **2-Step Verification** on your Google Account, search for **App Passwords**, name it "Maya AI", and copy the generated 16-letter code.
-   * **Step 2:** Simply open the **Telegram Bot on your mobile phone** (or the desktop chat interface) and tell Maya: 
-     > *"Save my email as devnilasarker@gmail.com and password as ssfszsctppzaotlx"*
-   * **Step 3:** Maya will automatically clean the password, encrypt the credentials securely, and save them in her local SQLite database. You're ready to send background emails! 🚀
+### Memory
 
-4. **Install All Dependencies**:
-   Open a terminal in the root `maya-ai` directory and run:
-   ```bash
-   npm run install:all
-   ```
-   *(This automatically creates the Python virtual environment and installs Node modules).*
+- **Two-tier storage:** a sliding short-term conversation window feeds a nightly **Dreaming Mode** pass that distills durable facts, preferences, and contacts into encrypted long-term memory.
+- **Semantic vector search:** `gemini-embedding-2` (3072-dim) vectors with local numpy similarity search over an encrypted SQLite store; weighted scoring combines similarity and importance, with gated retrieval to keep context compact.
+- **Importance-based expiry:** trivia fades, critical facts persist; retrieval stats (`retrieval_count`, `last_accessed`) inform ranking.
 
-## 🚀 Running the Application
+### Live Canvas
 
-Maya AI is configured to run both the frontend and backend concurrently in a single terminal.
+- Generates interactive HTML widgets (dashboards, trackers) in a split-screen panel, synced in real time across voice, chat, and Telegram via WebSockets.
+
+### Personality
+
+- Four switchable modes — Companion, Coding, Professional, Friendly — with dynamic prompt assembly based on OS context and memory, and enforced religion-neutral language.
+
+## Architecture
+
+```
+frontend/   React + Vite + Tauri desktop shell
+            Zustand state, WebAudio gapless playback, voice orb UI
+backend/    Python + FastAPI (localhost:8000)
+  api/          REST + WebSocket handlers, Telegram bot
+  brain/        orchestrator, multi-agent team, providers, memory, personality
+  voice/        VAD, transcription, TTS routing, voice state machine
+  tools/        desktop automation, browser, WhatsApp service (Node, port 9001)
+  skills/       hot-reloadable SKILL.md skills + AST-sandboxed plugins
+  system/       scheduler, state manager, hooks, observability
+  config/       mcp_servers.json and platform config
+```
+
+| Layer | Stack |
+|---|---|
+| LLM | Gemini 2.5 / 3.x via `google-genai`, multi-provider fallback |
+| Voice | Gemini native audio, Edge-TTS, faster-whisper, Silero VAD, GPT-SoVITS, ElevenLabs |
+| Vision/Automation | PyAutoGUI, mss, PyGetWindow, EasyOCR, RapidFuzz, Playwright |
+| Messaging | whatsapp-web.js (Node), python-telegram-bot, SMTP |
+| Storage | SQLite with hardware-bound AES encryption |
+
+## Requirements
+
+- Windows 10/11
+- Python 3.10+
+- Node.js 18+ (for the frontend and the WhatsApp service)
+- A Gemini API key ([free from Google AI Studio](https://aistudio.google.com/app/apikey))
+
+## Installation
+
+```bash
+git clone https://github.com/palnirupam/maya-ai.git
+cd maya-ai
+npm run install:all
+```
+
+`install:all` creates the Python virtual environment and installs all Python and Node dependencies.
+
+## Configuration
+
+### 1. API keys
+
+Create a `.env` file in the **project root**:
+
+```env
+GEMINI_API_KEY=your_gemini_api_key_here
+ELEVENLABS_API_KEY=your_elevenlabs_key_here   # optional
+```
+
+### 2. Email (conversational — no files to edit)
+
+1. Enable **2-Step Verification** on your Google account and generate an **App Password** named "Maya AI".
+2. Tell Maya (Telegram or desktop chat): *"Save my email as you@gmail.com and password as abcdabcdabcdabcd"*.
+3. Maya encrypts and stores the credentials locally. Background email is ready.
+
+### 3. WhatsApp pairing
+
+Ask Maya to connect WhatsApp with your phone number. She requests a pairing code from the background service; enter it on your phone under **Linked Devices**. The session persists across restarts — pairing is one-time.
+
+### 4. MCP servers (optional)
+
+Maya ships pre-configured with the Knowledge Graph memory server (`@modelcontextprotocol/server-memory`). Add any other MCP server (GitHub, PostgreSQL, Slack, …) in `backend/config/mcp_servers.json`, or simply tell Maya on Telegram to add one — she validates the package name and writes the config atomically.
+
+## Running
 
 ```bash
 npm start
 ```
-*The backend will launch on `localhost:8000` and the frontend Vite dev server will open automatically.*
 
----
+This launches the FastAPI backend (`localhost:8000`) and the Vite frontend (`localhost:1420`) concurrently. The WhatsApp service and Telegram bot start automatically with the backend.
 
-## 🛠️ Architecture Stack
+> **Note:** after a fresh start, the WhatsApp service takes ~30–60 seconds to reconnect. Maya waits for it automatically (up to 90 s) before sending, so messages issued during startup are delayed, not dropped.
 
-### Backend (Python + FastAPI)
-* **LLM Engine:** Gemini 2.5/3.5 Flash via `google-genai`
-* **Multi-Agent Orchestrator:** Stateful task delegation across specialized sub-agents (Researcher, Coder, OS Executor) with safety timeouts and loop constraints
-* **Voice:** Gemini Native Audio (default), Edge-TTS, Faster-Whisper, Silero VAD, GPT-SoVITS, ElevenLabs
-* **Vision & Automation:** PyAutoGUI, mss, PyGetWindow, EasyOCR, RapidFuzz
-* **Security:** AES Encrypted Settings, Sensitive App Keyword Blocking
+## Extending Maya
 
-### Frontend (React + Vite)
-* **State Management:** Zustand
-* **Audio:** WebAudio Context API (gapless queuing)
-* **UI/UX:** Animated Voice Orb, Push-to-Talk, Markdown rendering
+- **Markdown skills:** drop a `SKILL.md` file into `backend/skills/` and Maya learns it instantly — hot-reloaded, no restart, no Python boilerplate.
+- **Python plugins:** analyzed at the AST level before loading; dangerous imports (`os`, `eval`, `exec`) are rejected, and SHA-256 integrity checks detect tampering.
+- **Event hooks:** run local scripts on events such as `on_session_start`, `on_sensitive_app_detected`, or `on_command_approval_request` — path-restricted to `hooks/`, with execution timeouts and a concurrency cap.
+
+## Security Model
+
+- **Hardware-bound encryption:** keys and credentials are AES-encrypted with a key derived from your motherboard and CPU serials — the database is useless if copied to another machine.
+- **Permission gating:** tool categories (system control, screen capture, messaging) can be individually disabled; disabled tools are removed from the model's view entirely.
+- **Exec approval and audit:** dangerous OS commands are queued for human approval, and every tool action is logged to `audit.jsonl`.
+- **Screenshot protection:** if a password manager or banking tab is visible, screen capture is blocked; every screen inspection raises a visible Windows toast notification.
+- **Deterministic user-facing errors:** clarification prompts and failure messages are template-rendered in your language rather than generated, so degraded model output can never leak internal instructions.
+
+## Troubleshooting
+
+| Symptom | Cause & fix |
+|---|---|
+| "WhatsApp is not connected" right after startup | The service needs ~30–60 s to reconnect. Maya retries for up to 90 s; just wait a moment. |
+| Contact found on your phone but not by Maya | Check the saved spelling — fuzzy matching tolerates small typos but not entirely different names. You can always send by number directly. |
+| Degraded or odd replies late in the day | Free-tier Gemini quotas (e.g. 20 requests/day per model) push Maya onto fallback models. Quotas reset daily; critical flows (contact lists, errors) are deterministic and unaffected. |
+| MCP server fails to start with npm 404 | The package name in `backend/config/mcp_servers.json` doesn't exist on npm. Remove or correct the entry. |
 
 <br>
 <div align="center">
-  <i>Built with ❤️ for a better AI desktop experience.</i>
+  <i>Built with care for a better AI desktop experience.</i>
 </div>

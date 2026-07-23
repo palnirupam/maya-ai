@@ -2,27 +2,28 @@ from ...tools.desktop.mouse import mouse_tools
 from ...tools.desktop.keyboard import keyboard_tools
 from ...vision.capture.screen_capture import screen_capture
 
-from ...tools.desktop.apps import open_app, close_app, focus_app, list_open_apps, open_chrome_profile
+from ...tools.desktop.apps import open_app, close_app, close_apps_except, focus_app, list_open_apps, open_chrome_profile
 from ...tools.desktop.advanced.browser_tools import open_url, search_youtube, search_google, gmail_action, send_background_email, read_background_email, trash_background_email, permanent_delete_email
 from ...tools.desktop.advanced.playwright_browser import playwright_navigate, playwright_click, playwright_type, playwright_screenshot, playwright_get_content, playwright_close, playwright_upload_file
 from ...tools.desktop.advanced.google_meet_tools import google_meet_join, google_meet_leave
 from ...tools.desktop.advanced.google_classroom_tools import classroom_list_assignments, classroom_upload_file
 from ...tools.desktop.app_context import get_app_context
-from ...tools.desktop.advanced.file_system_tools import create_file, read_file, list_directory, delete_file, search_local_files
+from ...tools.unified import file, pc
 from ...tools.desktop.advanced.terminal_tools import execute_powershell, execute_python
-from ...tools.desktop.advanced.system_tools import get_active_windows, change_volume, read_clipboard, write_clipboard, get_system_stats, manage_processes, read_on_screen_text, whatsapp_call, whatsapp_send_message, whatsapp_revoke_message, whatsapp_get_pairing_code, whatsapp_send_file, whatsapp_send_multiple_files, read_whatsapp_chat, pause_media, setup_missing_tool
+from ...tools.desktop.advanced.system_tools import (get_active_windows, change_volume, read_clipboard, write_clipboard, get_system_stats, manage_processes, read_on_screen_text, whatsapp_call, whatsapp_send_message, whatsapp_revoke_message, whatsapp_get_pairing_code, whatsapp_send_file, whatsapp_send_multiple_files, read_whatsapp_chat, pause_media, setup_missing_tool, whatsapp_ui_send_message)
 from ...tools.desktop.advanced.youtube_player import play_youtube_background, stop_youtube_background
 from ...tools.desktop.advanced.vision_tools import find_and_click, wait_for_element, read_active_window_title, is_app_open, take_verified_screenshot
 from ...tools.desktop.advanced.memory_tools import remember_fact, recall_facts, forget_fact, schedule_reminder, configure_gmail_credentials, configure_mcp_server
 from ...tools.desktop.advanced.contacts import save_contact, get_contact_number, delete_contact
 from ...tools.desktop.shortcuts import perform_shortcut, control_brightness, control_display, manage_window
 from ...tools.web.search import web_search
+from ...tools.documents import create_pdf
 from ...tools.desktop.advanced.computer_use import background_app_control, vision_guided_action
 from ...tools.desktop.advanced.background_reader import get_app_text_content, get_active_window_info
+from ...system.canvas import update_canvas
 
 from ...database.connection import SessionLocal
-from ...database.models import UserPreferences
-from ...database.crypto import crypto_manager
+from ...database.preferences import read_permission_pref
 import logging
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ def look_at_screen() -> str:
     Capture a screenshot of the user's desktop to see what is currently on their screen.
     Returns the image data in base64 format.
     """
-    return "SCREENSHOT_TRIGGERED"
+    return take_verified_screenshot()
 
 def manage_system_state(action: str) -> str:
     """
@@ -93,19 +94,27 @@ CAPABILITY_MAP = {
         playwright_upload_file, google_meet_join, google_meet_leave,
         classroom_list_assignments, classroom_upload_file,
     ],
-    "PERM_FILESYSTEM": [create_file, read_file, list_directory, delete_file, search_local_files],
+    "PERM_FILESYSTEM": [file, create_pdf],
     "PERM_TERMINAL": [execute_powershell, execute_python],
     "PERM_SYSTEM": [
-        open_app, close_app, focus_app, list_open_apps, open_chrome_profile,
+        type_text, press_key, hotkey, click_mouse, double_click_mouse,
+        move_mouse_to, get_mouse_position, look_at_screen,
+        manage_system_state,
+        open_app, close_app, close_apps_except, focus_app, list_open_apps, open_chrome_profile,
         get_active_windows, change_volume, read_clipboard, write_clipboard,
         get_system_stats, manage_processes, read_on_screen_text,
         whatsapp_call, whatsapp_send_message, whatsapp_revoke_message, whatsapp_get_pairing_code,
         whatsapp_send_file, whatsapp_send_multiple_files, read_whatsapp_chat,
-        pause_media, setup_missing_tool,
+        pause_media, setup_missing_tool, whatsapp_ui_send_message,
         find_and_click, wait_for_element, read_active_window_title,
         is_app_open, take_verified_screenshot,
         play_youtube_background, stop_youtube_background,
         delete_contact,
+        perform_shortcut, control_brightness, control_display, manage_window,
+        background_app_control, vision_guided_action,
+        get_app_text_content, get_active_window_info,
+        configure_mcp_server,
+        pc,
     ],
     "PERM_WEB_SEARCH": [web_search]
 }
@@ -115,35 +124,21 @@ def get_maya_tools() -> list:
     Returns a dynamic list of tools based on the user's saved preferences.
     """
     tools = [
-        type_text, press_key, hotkey, click_mouse, 
-        double_click_mouse, move_mouse_to, get_mouse_position,
-        look_at_screen, manage_system_state, change_interaction_mode,
-        remember_fact, recall_facts, forget_fact, schedule_reminder, configure_gmail_credentials, configure_mcp_server,
-        # App management is always available (no special permission needed)
-        open_app, close_app, focus_app, list_open_apps, is_app_open, open_chrome_profile,
-        read_active_window_title,
+        change_interaction_mode,
+        remember_fact, recall_facts, forget_fact, schedule_reminder, configure_gmail_credentials,
         # Contact Manager
         save_contact, get_contact_number,
-        # Shortcuts & Laptop Controls (always available)
-        perform_shortcut, control_brightness, control_display, manage_window,
         # App Knowledge base
         get_app_context,
-        # Background Computer Use (always available — no mouse, no focus stealing)
-        background_app_control, vision_guided_action,
-        get_app_text_content, get_active_window_info,
+        # Canvas dynamic serving and rendering engine tool
+        update_canvas,
     ]
     
     db = SessionLocal()
     try:
         for perm_key, funcs in CAPABILITY_MAP.items():
-            pref = db.query(UserPreferences).filter(UserPreferences.key == perm_key).first()
-            if pref and pref.value:
-                try:
-                    decrypted = crypto_manager.decrypt(pref.value)
-                    if decrypted == "true":
-                        tools.extend(funcs)
-                except Exception as e:
-                    logger.error(f"Error decrypting {perm_key}: {e}")
+            if read_permission_pref(db, perm_key):
+                tools.extend(funcs)
     finally:
         db.close()
         
@@ -168,4 +163,3 @@ def get_maya_tools() -> list:
             unique_tools.append(tool)
 
     return unique_tools
-

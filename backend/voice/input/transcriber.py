@@ -6,31 +6,75 @@ import base64
 from typing import Optional
 from faster_whisper import WhisperModel
 
+from ...brain.language_style import latinize_transcript
+
 logger = logging.getLogger(__name__)
+
+# ── Hallucination guard ─────────────────────────────────────────────────────
+# Both Whisper and Gemini STT invent short stock phrases when handed silence or
+# ambient noise (fan, keyboard, distant chatter). The amplitude gate below only
+# catches near-silent clips; anything with mild background noise sails through
+# and comes back as one of these. Without this filter that garbage is treated
+# as a real user turn and Maya replies unprompted.
+import re as _re
+
+_HALLUCINATION_PHRASES = {
+    "you", "thank you", "thank you.", "thanks", "thanks for watching",
+    "thanks for watching!", "thank you for watching", "please subscribe",
+    "subscribe", "bye", "bye.", "okay", "ok", ".", "..", "...", "।", "।।",
+    "so", "uh", "um", "hmm", "hm", "yeah", "the", "a", "i", "oh",
+    "silence", "[silence]", "[music]", "[music playing]", "music",
+    "dhonnobad", "thik ache", "accha",
+}
+
+
+def _is_probable_hallucination(text: str) -> bool:
+    """Return True if a transcript is almost certainly STT noise, not speech."""
+    if not text:
+        return True
+    stripped = text.strip()
+    # Strip surrounding punctuation/whitespace for the phrase comparison.
+    normalized = _re.sub(r"[\s\.\!\?,।।]+", " ", stripped).strip().lower()
+    if not normalized:
+        return True
+    if normalized in _HALLUCINATION_PHRASES:
+        return True
+    # A meaningful command has real letters; a clip of just punctuation/symbols
+    # (".", "...", "♪") carries no intent.
+    if not _re.search(r"[a-z0-9ঀ-৿ऀ-ॿ]", normalized):
+        return True
+    return False
 
 # ── Gemini STT ────────────────────────────────────────────────────────────────
 # Uses Gemini's audio understanding capability to transcribe Bengali/Hindi/English
-# and mixed-language (Banglish/Hinglish) with near-perfect accuracy.
+# and mixed-language (Banglish/Hindilish) with near-perfect accuracy.
 # Falls back to Faster-Whisper if Gemini API is unavailable.
 
-_GEMINI_STT_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.0-flash:generateContent"
-)
+def _get_gemini_stt_url() -> str:
+    try:
+        from ...config.model_config import get_model
+        model_name = get_model("fast")
+    except ImportError:
+        model_name = "gemini-3.5-flash"  # safe default if run standalone
+    return (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model_name}:generateContent"
+    )
 
 _STT_PROMPT = (
     "Transcribe the following audio exactly as spoken. "
     "The speaker may use Bengali, Hindi, English, or any mix of these languages "
-    "(Banglish / Hinglish). "
-    "Preserve the exact words and script: use Bengali Unicode for Bengali words, "
-    "Devanagari for Hindi words, and Latin script for English words. "
-    "Output ONLY the transcription — no explanations, no punctuation corrections, "
-    "no extra words."
+    "(Banglish / Hindilish). Write every word with English/Latin letters: romanize "
+    "spoken Bangla as natural Banglish and spoken Hindi as natural Hindilish, while "
+    "keeping English words unchanged. Never output Bengali or Devanagari characters. "
+    "Output ONLY the transcription - no explanations, no punctuation corrections, "
+    "and no extra words."
 )
 
 
 def _get_gemini_api_key() -> Optional[str]:
     """Fetch Gemini API key — tries DB first, then environment variable."""
+    key = None
     # Try both import path styles (standalone script vs uvicorn module)
     for module_prefix in ("backend.database", "database"):
         try:
@@ -43,13 +87,22 @@ def _get_gemini_api_key() -> Optional[str]:
                     model_mod.UserPreferences.key == "GEMINI_API_KEY"
                 ).first()
                 if pref and pref.value:
-                    return crypto_mod.crypto_manager.decrypt(pref.value).strip()
+                    key = crypto_mod.crypto_manager.decrypt(pref.value).strip()
+                    break
             finally:
                 db.close()
         except Exception:
             continue
-    # Last resort: environment variable
-    return os.getenv("GEMINI_API_KEY")
+    if not key:
+        # Last resort: environment variable
+        key = os.getenv("GEMINI_API_KEY")
+
+    if key:
+        key_lower = key.lower()
+        if any(key_lower.startswith(prefix) for prefix in ("gsk_", "sk-", "nvapi-", "sk-or-")):
+            logger.debug(f"[GeminiSTT] API Key appears to be for another provider ({key[:4]}...) — bypassing Gemini STT.")
+            return None
+    return key
 
 
 async def _transcribe_with_gemini(wav_path: str) -> Optional[str]:
@@ -85,7 +138,7 @@ async def _transcribe_with_gemini(wav_path: str) -> Optional[str]:
         import httpx
         async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(
-                _GEMINI_STT_URL,
+                _get_gemini_stt_url(),
                 params={"key": api_key},
                 json=payload,
             )
@@ -95,7 +148,9 @@ async def _transcribe_with_gemini(wav_path: str) -> Optional[str]:
             return None
 
         data = resp.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        text = latinize_transcript(
+            data["candidates"][0]["content"]["parts"][0]["text"]
+        )
         logger.info(f"[GeminiSTT] ✅ Transcribed: {text}")
         return text
 
@@ -189,8 +244,14 @@ class Transcriber:
                     if max_amp < 100:
                         logger.warning(
                             "[Transcriber] Audio is nearly silent — "
-                            "microphone may be muted or wrong device selected."
+                            "ignoring it instead of asking STT to guess."
                         )
+                        if wav_path_to_cleanup and os.path.exists(wav_path_to_cleanup):
+                            try:
+                                os.remove(wav_path_to_cleanup)
+                            except Exception:
+                                pass
+                        return ""
             except Exception as e:
                 logger.debug(f"[Transcriber] Amplitude check failed: {e}")
 
@@ -207,6 +268,13 @@ class Transcriber:
                             os.remove(wav_path_to_cleanup)
                         except Exception:
                             pass
+                    if _is_probable_hallucination(gemini_text):
+                        logger.warning(
+                            "[Transcriber] Gemini output '%s' looks like a noise "
+                            "hallucination — ignoring.",
+                            gemini_text.strip(),
+                        )
+                        return ""
                     return gemini_text
             except Exception as e:
                 logger.warning(f"[Transcriber] Gemini STT error: {e} — using Whisper.")
@@ -224,15 +292,16 @@ class Transcriber:
                     language=None,
                     vad_filter=False,
                     initial_prompt=(
-                        "হ্যালো মায়া, কেমন আছো? "
-                        "नमस्ते माया, आप कैसे हैं? "
-                        "Hello Maya, how are you doing?"
+                        "Hello Maya, how are you? Please do this now. "
+                        "Maya, kemon acho? Ekhon eta kore dao. "
+                        "Namaste Maya, aap kaise hain? Abhi ye kar do. "
+                        "The speaker may use English, Bengali, Hindi, or a mix."
                     ),
                 )
                 return "".join(seg.text for seg in segments)
 
-            text = await asyncio.to_thread(_run_whisper)
-            logger.info(f"[Transcriber][Whisper] Transcribed: {text.strip()}")
+            text = latinize_transcript(await asyncio.to_thread(_run_whisper))
+            logger.info(f"[Transcriber][Whisper] Transcribed: {text}")
         except Exception as e:
             logger.error(f"[Transcriber] Whisper error: {e}")
             text = ""
@@ -242,6 +311,14 @@ class Transcriber:
                     os.remove(wav_path_to_cleanup)
                 except Exception:
                     pass
+
+        if _is_probable_hallucination(text):
+            logger.warning(
+                "[Transcriber] Whisper output '%s' looks like a noise "
+                "hallucination — ignoring.",
+                text.strip(),
+            )
+            return ""
 
         return text.strip()
 

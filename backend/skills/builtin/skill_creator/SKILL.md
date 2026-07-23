@@ -46,7 +46,7 @@ When the user says: <trigger phrase(s)>
 
 ### Step 3 — Save the file
 
-Use the `create_file` tool to save it at:
+Use `file(action="write", src="<path>", dst="<content>")` to save it at:
 ```
 c:\maya-ai\backend\skills\user_skills\<skill-name>\SKILL.md
 ```

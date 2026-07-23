@@ -92,7 +92,10 @@ class MayaScheduler:
             # Dispatch
             if task.notify_channel == "chat_message":
                 from ..api.telegram_bot import telegram_bot_manager
-                if telegram_bot_manager and telegram_bot_manager.application:
+                # Guard: TelegramBotManager uses raw HTTP polling — it has no
+                # `.application` attribute. Check `.running` instead and call
+                # the internal HTTP helper directly to send the notification.
+                if telegram_bot_manager and telegram_bot_manager.running:
                     from ..database.models import UserPreferences
                     chat_id_pref = db.query(UserPreferences).filter(UserPreferences.key == "TELEGRAM_CHAT_ID").first()
                     if chat_id_pref and chat_id_pref.value:
@@ -100,7 +103,9 @@ class MayaScheduler:
                             chat_id = crypto_manager.decrypt(chat_id_pref.value)
                             if not chat_id:
                                 chat_id = chat_id_pref.value
-                            asyncio.create_task(telegram_bot_manager.application.bot.send_message(chat_id=chat_id, text=message))
+                            # _send_message is a coroutine — wrap in a task so
+                            # we don't block the scheduler loop.
+                            asyncio.create_task(telegram_bot_manager._send_message(chat_id, message))
                         except Exception as e:
                             logger.error(f"Failed to send to telegram: {e}")
             elif task.notify_channel == "gui_popup":
