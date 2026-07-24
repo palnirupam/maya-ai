@@ -6,7 +6,50 @@ import logging
 from cryptography.fernet import Fernet, MultiFernet, InvalidToken
 from pathlib import Path
 
+import ctypes
+
 from backend.config.runtime_paths import DATA_DIR
+
+
+class KeyUnreadableError(Exception):
+    """Raised when data cannot be decrypted due to hardware key mismatch or DPAPI failure."""
+    pass
+
+
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+
+def win_dpapi_encrypt(data: bytes) -> bytes:
+    """Encrypt raw bytes using Windows DPAPI (CryptProtectData)."""
+    if os.name != "nt" or os.getenv("MAYA_TESTING") == "1":
+        return data
+    try:
+        data_in = _DATA_BLOB(len(data), ctypes.cast(ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_ubyte)))
+        data_out = _DATA_BLOB()
+        if ctypes.windll.crypt32.CryptProtectData(ctypes.byref(data_in), "MayaSaltKey", None, None, None, 0, ctypes.byref(data_out)):
+            buf = ctypes.string_at(data_out.pbData, data_out.cbData)
+            ctypes.windll.kernel32.LocalFree(data_out.pbData)
+            return buf
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"[DPAPI] CryptProtectData error: {e}")
+    return data
+
+
+def win_dpapi_decrypt(data: bytes) -> bytes:
+    """Decrypt bytes using Windows DPAPI (CryptUnprotectData)."""
+    if os.name != "nt" or os.getenv("MAYA_TESTING") == "1":
+        return data
+    try:
+        data_in = _DATA_BLOB(len(data), ctypes.cast(ctypes.create_string_buffer(data), ctypes.POINTER(ctypes.c_ubyte)))
+        data_out = _DATA_BLOB()
+        if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(data_in), None, None, None, None, 0, ctypes.byref(data_out)):
+            buf = ctypes.string_at(data_out.pbData, data_out.cbData)
+            ctypes.windll.kernel32.LocalFree(data_out.pbData)
+            return buf
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"[DPAPI] CryptUnprotectData error: {e}")
+    raise KeyUnreadableError("DPAPI decryption failed: unauthorized user account or corrupted salt file.")
 
 
 KEY_FILE = DATA_DIR / ".fernet_key"      # legacy random-key file (pre hardware-key migration)
@@ -14,6 +57,7 @@ SALT_FILE = DATA_DIR / ".salt"
 FP_CACHE_FILE = DATA_DIR / ".fp_check"   # sha256 of the primary fingerprint (drift detection only)
 
 _logger = logging.getLogger(__name__)
+
 
 
 def _run(cmd: str) -> str:
@@ -95,11 +139,19 @@ def _candidate_fingerprints() -> list[str]:
 def _load_salt() -> bytes:
     if SALT_FILE.exists():
         with open(SALT_FILE, "rb") as f:
-            return f.read()
+            raw = f.read()
+        try:
+            return win_dpapi_decrypt(raw)
+        except KeyUnreadableError:
+            # Fallback if unencrypted legacy salt exists
+            if len(raw) == 16:
+                return raw
+            raise
     salt = os.urandom(16)
     SALT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    encrypted_salt = win_dpapi_encrypt(salt)
     with open(SALT_FILE, "wb") as f:
-        f.write(salt)
+        f.write(encrypted_salt)
     _harden(SALT_FILE)
     return salt
 
@@ -191,9 +243,9 @@ class CryptoManager:
         return _primary.encrypt(data.encode()).decode()
 
     @staticmethod
-    def decrypt(token: str) -> str:
-        """Decrypt using any known candidate key. Returns '' only when the token
-        truly cannot be decrypted by any key (genuinely lost or tampered)."""
+    def decrypt(token: str, raise_on_failure: bool = False) -> str:
+        """Decrypt using any known candidate key. If token is invalid or unreadable,
+        raises KeyUnreadableError when raise_on_failure=True, otherwise returns ''."""
         if not token:
             return ""
         try:
@@ -201,13 +253,18 @@ class CryptoManager:
         except InvalidToken:
             _logger.error("[CRYPTO] Decryption failed — no candidate key matched "
                           "(data encrypted on different hardware, or tampered).")
+            if raise_on_failure:
+                raise KeyUnreadableError("Data cannot be decrypted: key mismatch or tampered data.")
             return ""
         except Exception as e:
             _logger.error(f"[CRYPTO] Decryption error: {e}")
+            if raise_on_failure:
+                raise KeyUnreadableError(f"Decryption error: {e}")
             return ""
 
     @staticmethod
     def needs_rotation(token: str) -> bool:
+
         """True if the token decrypts with a non-primary candidate key and should
         be re-encrypted under the primary key."""
         if not token:

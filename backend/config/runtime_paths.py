@@ -1,7 +1,9 @@
 """Stable, overridable locations for Maya's mutable runtime data."""
 
 import os
+import sys
 from pathlib import Path
+
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -17,5 +19,30 @@ def runtime_path(env_name: str, default: Path) -> Path:
     return path.resolve()
 
 
-DATA_DIR = runtime_path("MAYA_DATA_DIR", PROJECT_ROOT / "data")
-STATE_DIR = runtime_path("MAYA_STATE_DIR", BACKEND_ROOT / "state")
+def _get_default_data_dir() -> Path:
+    if getattr(sys, "frozen", False) or os.getenv("MAYA_USE_LOCALAPPDATA", "1") == "1":
+        if os.name == "nt":
+            local_appdata = os.getenv("LOCALAPPDATA", "").strip()
+            if local_appdata:
+                return Path(local_appdata) / "MayaAI" / "data"
+    return PROJECT_ROOT / "data"
+
+
+def _get_default_state_dir() -> Path:
+    if getattr(sys, "frozen", False) or os.getenv("MAYA_USE_LOCALAPPDATA", "1") == "1":
+        if os.name == "nt":
+            local_appdata = os.getenv("LOCALAPPDATA", "").strip()
+            if local_appdata:
+                return Path(local_appdata) / "MayaAI" / "state"
+    return BACKEND_ROOT / "state"
+
+
+DATA_DIR = runtime_path("MAYA_DATA_DIR", _get_default_data_dir())
+STATE_DIR = runtime_path("MAYA_STATE_DIR", _get_default_state_dir())
+LOGS_DIR = runtime_path("MAYA_LOGS_DIR", DATA_DIR / "logs")
+
+# Ensure all runtime directories are created recursively on import
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+

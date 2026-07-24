@@ -44,6 +44,94 @@ class WhatsAppManager:
         self.api_key = self._get_or_create_key()
         self._startup_error = None
 
+    def is_tos_accepted(self) -> bool:
+        """Return True if user explicitly accepted WhatsApp ToS consent gate."""
+        if os.getenv("MAYA_TESTING") == "1":
+            return os.getenv("MAYA_WA_TOS_ACCEPTED", "1") == "1"
+
+        try:
+            from backend.database.connection import SessionLocal
+            from backend.database.models import UserPreferences
+            from backend.database.crypto import crypto_manager
+            db = SessionLocal()
+            try:
+                pref = db.query(UserPreferences).filter(UserPreferences.key == "WHATSAPP_TOS_ACCEPTED").first()
+                if pref and pref.value:
+                    val = crypto_manager.decrypt(pref.value).strip().lower()
+                    return val in {"1", "true", "yes"}
+            finally:
+                db.close()
+        except Exception:
+            pass
+        return False
+
+    def set_tos_consent(self, accepted: bool) -> bool:
+        """Store WhatsApp ToS consent in DB."""
+        try:
+            from backend.database.connection import SessionLocal
+            from backend.database.models import UserPreferences
+            from backend.database.crypto import crypto_manager
+            db = SessionLocal()
+            try:
+                val = "true" if accepted else "false"
+                enc = crypto_manager.encrypt(val)
+                pref = db.query(UserPreferences).filter(UserPreferences.key == "WHATSAPP_TOS_ACCEPTED").first()
+                if pref:
+                    pref.value = enc
+                else:
+                    pref = UserPreferences(key="WHATSAPP_TOS_ACCEPTED", value=enc)
+                    db.add(pref)
+                db.commit()
+                return True
+            finally:
+                db.close()
+        except Exception as e:
+            logger.error(f"[WA] Failed to save ToS consent: {e}")
+            return False
+
+    def get_status(self) -> dict:
+        """Returns status payload for frontend polling / UI notification banner."""
+        tos_ok = self.is_tos_accepted()
+        if not tos_ok:
+            return {
+                "available": False,
+                "status": "consent_required",
+                "tos_accepted": False,
+                "error": "WhatsApp ToS consent required before starting service",
+                "banner_message": "WhatsApp unavailable — ToS consent required"
+            }
+
+        bridge_data = None
+        if self._port_9001_is_listening():
+            try:
+                resp = httpx.get("http://127.0.0.1:9001/status", timeout=1.5, headers=self._get_headers())
+                if resp.status_code == 200:
+                    bridge_data = resp.json()
+            except Exception:
+                pass
+
+        running = (self.process is not None and self.process.poll() is None) or self._port_9001_is_listening()
+        if running:
+            b_status = bridge_data.get("status") if (bridge_data and "status" in bridge_data) else "running"
+            return {
+                "available": True,
+                "status": b_status,
+                "tos_accepted": True,
+                "error": None,
+                "banner_message": None,
+                "details": bridge_data
+            }
+
+        return {
+            "available": False,
+            "status": "unavailable",
+            "tos_accepted": True,
+            "error": self._startup_error or "WhatsApp service is not running",
+            "banner_message": "WhatsApp unavailable — Telegram active"
+        }
+
+
+
     def _get_or_create_key(self):
         import os
         import sys
@@ -135,12 +223,18 @@ class WhatsAppManager:
 
     def start(self) -> bool:
         """Start Maya's service without ever terminating another process."""
+        if not self.is_tos_accepted():
+            self._startup_error = "WhatsApp ToS consent required before starting service."
+            logger.warning("[WA] %s", self._startup_error)
+            return False
+
         if self.process:
             if self.process.poll() is None:
                 self._startup_error = None
                 return True
             self.process = None
             self._close_log_file()
+
 
         self._startup_error = None
         try:
@@ -235,26 +329,8 @@ class WhatsAppManager:
             # Prevent descriptor leaks across repeated integration toggles.
             self._close_log_file()
 
-    def get_status(self) -> dict:
-        """Check status, retrying up to 3 times to handle brief reconnect windows."""
-        if self._startup_error:
-            return {"status": "disconnected", "error": self._startup_error}
-        for attempt in range(3):
-            try:
-                resp = httpx.get("http://127.0.0.1:9001/status", timeout=3.0, headers=self._get_headers())
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if data.get("status") in ["connected", "authenticated"]:
-                        return data
-                    # Not connected yet — wait briefly and retry
-                    if attempt < 2:
-                        time.sleep(2)
-            except Exception:
-                if attempt < 2:
-                    time.sleep(2)
-        return {"status": "disconnected"}
-
     def wait_for_connected(self, timeout_seconds: int = 90) -> bool:
+
         """Poll until WhatsApp is 'connected' or 'authenticated' (both can send). Returns True if ready within timeout."""
         if self._startup_error:
             logger.error("[WA] Cannot wait for WhatsApp: %s", self._startup_error)

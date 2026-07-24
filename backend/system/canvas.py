@@ -9,7 +9,10 @@ from backend.config.runtime_paths import STATE_DIR
 
 logger = logging.getLogger(__name__)
 
-CANVAS_DIR = str((STATE_DIR / "canvas").resolve())
+_canvas_path = STATE_DIR / "canvas"
+_canvas_path.mkdir(parents=True, exist_ok=True)
+CANVAS_DIR = str(_canvas_path.resolve())
+
 
 MAX_CANVAS_SIZE = 1024 * 1024  # 1MB
 MAX_UPDATES_PER_MIN = 20

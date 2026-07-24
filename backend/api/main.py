@@ -375,3 +375,20 @@ if _DEBUG_ROUTES_ENABLED:
     )
     app.add_api_route("/skills", list_skills, methods=["GET"], include_in_schema=False)
     app.add_api_route("/voice/stats", voice_stats, methods=["GET"], include_in_schema=False)
+
+
+@app.get("/status/whatsapp")
+def get_whatsapp_status():
+    from backend.tools.desktop.advanced.whatsapp_manager import whatsapp_manager
+    return whatsapp_manager.get_status()
+
+
+@app.post("/whatsapp/consent")
+def set_whatsapp_consent(payload: dict):
+    from backend.tools.desktop.advanced.whatsapp_manager import whatsapp_manager
+    accepted = bool(payload.get("accepted", False))
+    ok = whatsapp_manager.set_tos_consent(accepted)
+    if ok and accepted:
+        whatsapp_manager.start()
+    return {"status": "ok", "tos_accepted": accepted, "whatsapp_status": whatsapp_manager.get_status()}
+

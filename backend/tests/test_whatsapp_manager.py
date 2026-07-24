@@ -316,12 +316,12 @@ def test_get_status_surfaces_known_startup_error_without_polling():
     with patch(
         "backend.tools.desktop.advanced.whatsapp_manager.httpx.get"
     ) as get:
-        assert manager.get_status() == {
-            "status": "disconnected",
-            "error": "Port conflict",
-        }
+        status = manager.get_status()
+        assert status["available"] is False
+        assert status["error"] == "Port conflict"
 
     get.assert_not_called()
+
 
 
 def test_reply_to_chat_logs_no_chat_id_or_response_body():
