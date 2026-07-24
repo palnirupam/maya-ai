@@ -93,7 +93,8 @@ class TestRetrieveMemoryFuzzing(unittest.TestCase):
             embedding_model=expected_model,
         )
         mock_db = MagicMock()
-        mock_db.query.return_value.all.return_value = [row]
+        # New query chain: .filter().order_by().limit().all()
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [row]
         mock_session_local.return_value = mock_db
 
         results = retrieve_relevant_memories(context_text="some query")
@@ -114,7 +115,8 @@ class TestRetrieveMemoryFuzzing(unittest.TestCase):
             embedding_model=expected_model,
         )
         mock_db = MagicMock()
-        mock_db.query.return_value.all.return_value = [row]
+        # New query chain: .filter().order_by().limit().all()
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [row]
         mock_session_local.return_value = mock_db
 
         results = retrieve_relevant_memories(context_text="some query")  # must not raise
@@ -132,7 +134,8 @@ class TestRetrieveMemoryFuzzing(unittest.TestCase):
             importance=5,
         )
         mock_db = MagicMock()
-        mock_db.query.return_value.all.return_value = [row]
+        # New query chain: .filter().order_by().limit().all()
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [row]
         mock_session_local.return_value = mock_db
 
         results = retrieve_relevant_memories(context_text="")

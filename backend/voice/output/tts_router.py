@@ -13,13 +13,25 @@ from backend.database.crypto import crypto_manager
 logger = logging.getLogger(__name__)
 
 
+# Valid TTS provider identifiers.
+_VALID_TTS_PROVIDERS = frozenset({"edge", "gemini", "elevenlabs", "gpt_sovits"})
+
+# Edge TTS is the default: zero-latency, zero-API-dependency, always available.
+# Users can switch to Gemini Native Audio / ElevenLabs / GPT-SoVITS from Settings.
+_DEFAULT_TTS_PROVIDER = "edge"
+
+
 class TTSRouter:
     """
-    Smart TTS router:
-      Allows selection of a primary TTS provider:
-      - 'edge': Microsoft Edge TTS (built-in, free, fast)
-      - 'elevenlabs': ElevenLabs / cvoice.ai (cloud voice clone)
-      - 'gpt_sovits': GPT-SoVITS (local offline voice clone)
+    Smart TTS router with graceful fallback chain:
+      Primary (user-configurable, default: Edge TTS)
+        → Fallback: Edge TTS (always available, ~50ms latency)
+
+    Provider options:
+      - 'edge'       : Microsoft Edge TTS — free, fast, offline-capable  [DEFAULT]
+      - 'gemini'     : Gemini Native Audio — ultra-realistic, cloud-only
+      - 'elevenlabs' : ElevenLabs / cvoice.ai — voice clone, cloud-only
+      - 'gpt_sovits' : GPT-SoVITS — local offline voice clone
     """
 
     def __init__(self):
@@ -27,7 +39,7 @@ class TTSRouter:
         self._gpt_sovits = GPTSoVITSAdapter()
         self._elevenlabs = ElevenLabsAdapter()
         self._gemini = GeminiLiveAdapter()
-        self.primary_provider = "gemini"  # default: Gemini Native Audio
+        self.primary_provider = _DEFAULT_TTS_PROVIDER
         self.reload_key()
 
     def reload_key(self):
@@ -43,20 +55,24 @@ class TTSRouter:
             if pref and pref.value:
                 try:
                     stored = crypto_manager.decrypt(pref.value).strip()
-                    # 'edge' was the old auto-default — upgrade it to 'gemini'.
-                    # Only honour explicit user choices: 'gemini', 'elevenlabs', 'gpt_sovits'.
-                    if stored in ("gemini", "elevenlabs", "gpt_sovits"):
+                    # Accept any valid provider the user explicitly chose.
+                    # Fall back to the default if the stored value is unrecognised.
+                    if stored in _VALID_TTS_PROVIDERS:
                         self.primary_provider = stored
                     else:
-                        self.primary_provider = "gemini"  # upgrade old 'edge' default
+                        logger.warning(
+                            f"Unknown TTS provider '{stored}' in preferences — "
+                            f"reverting to default '{_DEFAULT_TTS_PROVIDER}'."
+                        )
+                        self.primary_provider = _DEFAULT_TTS_PROVIDER
                 except Exception:
-                    self.primary_provider = "gemini"
+                    self.primary_provider = _DEFAULT_TTS_PROVIDER
             else:
-                self.primary_provider = "gemini"
+                self.primary_provider = _DEFAULT_TTS_PROVIDER
             logger.info(f"TTS Router reloaded. Primary TTS Provider: {self.primary_provider}")
         except Exception as e:
             logger.error(f"Failed to reload primary TTS provider: {e}")
-            self.primary_provider = "gemini"
+            self.primary_provider = _DEFAULT_TTS_PROVIDER
         finally:
             db.close()
 

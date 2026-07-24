@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from sqlalchemy import or_
 from ...database.connection import SessionLocal
 from ...database.models import LongTermMemory
@@ -9,8 +10,17 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-def _get_embedding(text: str) -> list[float] | None:
-    """Generates embedding vector using the configured cloud embedding model."""
+# Maximum rows loaded from DB per retrieval call.
+# Keeps Python-side scoring O(N) bounded even as memory grows.
+_DB_LOAD_LIMIT = 300
+
+# LRU cache size for embeddings (number of distinct query strings cached).
+# Each entry is ~3KB (768-dim float list). 128 entries ≈ 400KB max footprint.
+_EMBEDDING_CACHE_SIZE = 128
+
+
+def _get_embedding_uncached(text: str) -> list[float] | None:
+    """Calls Gemini API to generate an embedding vector. Use _get_embedding() instead."""
     try:
         from ...config.model_config import get_model
         from ..providers.gemini_adapter import gemini_adapter
@@ -31,6 +41,29 @@ def _get_embedding(text: str) -> list[float] | None:
     except Exception as e:
         logger.warning(f"Failed to generate embedding from Gemini API: {e}")
         return None
+
+
+@lru_cache(maxsize=_EMBEDDING_CACHE_SIZE)
+def _get_embedding_cached(text: str) -> tuple[float, ...] | None:
+    """
+    LRU-cached embedding lookup.
+
+    Returns a *tuple* (hashable, required by lru_cache) or None.
+    Cache hit: O(1), zero API calls.
+    Cache miss: one Gemini API call, then cached for subsequent identical queries.
+    """
+    result = _get_embedding_uncached(text)
+    return tuple(result) if result else None
+
+
+def _get_embedding(text: str) -> list[float] | None:
+    """
+    Public embedding helper. Returns a list (for numpy compatibility).
+    Internally uses the LRU-cached version to avoid redundant Gemini API calls.
+    """
+    cached = _get_embedding_cached(text)
+    return list(cached) if cached is not None else None
+
 
 def store_memory(category: str, content: str, importance: int = 3, source_session_id: str = None) -> bool:
     """Stores a memory encrypted in the database. Generates and stores its embedding."""
@@ -77,27 +110,47 @@ def retrieve_relevant_memories(context_text: str = "", active_category: str = No
     """
     Retrieves relevant memories using semantic search and cosine similarity.
     Balances relevance with importance. Fallbacks to keyword matching on failures.
+
+    Performance profile (post-fix):
+      - DB query: pre-filters expired rows and caps at _DB_LOAD_LIMIT rows in SQL.
+      - Embedding: LRU-cached — identical context_text hits are O(1), zero API calls.
+      - Python scoring loop: O(_DB_LOAD_LIMIT) worst case.
     """
     SIMILARITY_THRESHOLD = 0.45
     TOP_K = 8
     MAX_BACKFILL_PER_QUERY = 5
-    
+    now = datetime.now(timezone.utc)
+
     db = SessionLocal()
     try:
-        query = db.query(LongTermMemory)
-        memories = query.all()
-        
-        # Determine if we should attempt semantic search
+        # --- DB-level filtering (replaces query.all()) ---
+        # 1. Exclude expired memories in SQL (no Python-side date check needed).
+        # 2. Sort by importance DESC so the most important rows survive the LIMIT.
+        # 3. Cap at _DB_LOAD_LIMIT rows — bounds Python loop regardless of DB size.
+        memories = (
+            db.query(LongTermMemory)
+            .filter(
+                or_(
+                    LongTermMemory.expires_at.is_(None),
+                    LongTermMemory.expires_at > now,
+                )
+            )
+            .order_by(LongTermMemory.importance.desc())
+            .limit(_DB_LOAD_LIMIT)
+            .all()
+        )
+
+        # Determine if we should attempt semantic search (LRU-cached Gemini call)
         query_vector = None
         if context_text and len(context_text.strip()) > 0:
             query_vector = _get_embedding(context_text)
-            
+
         # Fallback keyword logic setup
         keywords = set(word.lower() for word in context_text.split() if len(word) > 3) if context_text else set()
-        
+
         results_with_scores = []
         backfill_updates = []
-        
+
         for mem in memories:
             try:
                 decrypted_category = crypto_manager.decrypt(mem.category)
