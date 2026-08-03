@@ -31,7 +31,8 @@ _DIRECT_APP_FOCUS_PATTERNS = re.compile(
 # message, a question, or a complaint) — fall back to the LLM.
 _DIRECT_APP_BLOCKERS = re.compile(
     r"\b(send|message|msg|pathao|call|reply|read|poro|delete|trash|revoke"
-    r"|problem|somossa|sommosha|issue|fail|failed|parche|perche|parchi|keno|why)\b",
+    r"|problem|somossa|sommosha|issue|fail|failed|parche|perche|parchi|keno|why"
+    r"|hocche\s+na|hochhe\s+na|hoche\s+na|hoyni|hoye\s+ni|not\s+opening)\b",
     re.IGNORECASE,
 )
 
@@ -168,6 +169,11 @@ _OS_MUTE_RE = re.compile(
     re.IGNORECASE,
 )
 _OS_CLIPBOARD_RE = re.compile(r"\bclipboard\b|ক্লিপবোর্ড", re.IGNORECASE)
+_OS_CAMERA_PHOTO_RE = re.compile(
+    r"\b(?:(?:take|click|capture|tolo|tul|tule)\s+(?:a\s+)?(?:photo|picture|selfie)"
+    r"|(?:photo|picture|selfie)\s+(?:take|click|capture|tolo|tul|tule|dao))\b",
+    re.IGNORECASE,
+)
 # Bluetooth / WiFi — common misspellings included ("blootooth" seen in live log).
 _OS_BT_RE = re.compile(
     r"\b(bluetooth|blutooth|blootooth|bluetuth|blueth?ooth?|bt)\b|ব্লুটুথ|ব্লু টুথ",
@@ -278,6 +284,10 @@ def _parse_direct_os_action(text: str, last_control: str | None = None):
     if _OS_LOCK_RE.search(t):
         return ("perform_shortcut", {"action": "lock"}, None, "PC lock kore dilam.")
 
+    # Verify a new Camera Roll image before reporting success.
+    if _OS_CAMERA_PHOTO_RE.search(t):
+        return ("pc", {"action": "camera_photo"}, None, None)
+
     # Power controls are deterministic so the model cannot invent a capability
     # refusal. The caller recognizes these pc actions as dangerous and pauses
     # for approval before invoking the tool.
@@ -327,15 +337,68 @@ def _parse_direct_os_action(text: str, last_control: str | None = None):
     return None
 
 
-def _format_direct_os_response(func_name: str, result: str, display_msg: str | None) -> str:
+def _format_direct_os_response(
+    func_name: str,
+    result: str,
+    display_msg: str | None,
+    style: str = "banglish",
+    kwargs: dict | None = None,
+) -> str:
     """User-facing reply for a deterministic OS control."""
+    from ..language_style import BANGLISH, ENGLISH, HINDILISH
+
     r = str(result)
-    # "ERR" covers both "ERROR:" and the unified tools' "ERR:" prefix.
     if r.upper().startswith(("ERR", "BLOCKED", "FAIL")):
+        if style == ENGLISH:
+            return f"I couldn't complete that action: {r}"
+        if style == HINDILISH:
+            return f"Yeh action complete nahi hua: {r}"
         return f"Kaj ta korte parlam na: {r}"
+
     if func_name == "read_clipboard":
-        snippet = r if len(r) <= 500 else r[:500] + " …"
+        snippet = r if len(r) <= 500 else r[:500] + " ..."
+        if style == ENGLISH:
+            return f"Clipboard content:\n{snippet}" if snippet.strip() else "The clipboard is empty."
+        if style == HINDILISH:
+            return f"Clipboard me yeh hai:\n{snippet}" if snippet.strip() else "Clipboard abhi khaali hai."
         return f"Clipboard e ache:\n{snippet}" if snippet.strip() else "Clipboard ekhon khali."
+
+    action = str((kwargs or {}).get("action") or "")
+    if func_name == "pc" and action == "camera_photo":
+        if r.upper().startswith("PARTIAL:"):
+            details = r[8:].strip() if len(r) > 8 else r
+            if style == ENGLISH:
+                return f"Photo taken but couldn't verify save location: {details}"
+            if style == HINDILISH:
+                return f"Photo le li lekin save location confirm nahi kar payi: {details}"
+            return f"Photo tulechi kintu file location confirm korte parini: {details}"
+        if r.upper().startswith(("SUCCESS:", "OK:")):
+            # Extract path from "SUCCESS: Camera photo saved: /path/to/file.jpg" or "OK: /path"
+            if ":" in r and len(r.split(":", 2)) >= 3:
+                path = r.split(":", 2)[-1].strip()
+            else:
+                path = r.split(":", 1)[-1].strip()
+            if style == ENGLISH:
+                return f"Took the photo and saved it here: {path}"
+            if style == HINDILISH:
+                return f"Photo le li aur yahan save kar diya: {path}"
+            return f"Photo tule ekhane save kore dilam: {path}"
+
     if func_name == "pc" and display_msg is None:
-        return r  # informational result (e.g. battery) — show it, don't paraphrase to "Done"
-    return display_msg or "Ho'e gche."
+        if style == ENGLISH:
+            return f"Current status:\n{r}"
+        if style == HINDILISH:
+            return f"Current status yeh hai:\n{r}"
+        return f"Current status:\n{r}"
+
+    if style == BANGLISH:
+        return display_msg or "Hoye geche."
+    if func_name == "change_volume":
+        level = (kwargs or {}).get("level")
+        return f"Volume set to {level}%." if style == ENGLISH else f"Volume {level}% kar diya."
+    if func_name == "control_brightness":
+        value = (kwargs or {}).get("direction")
+        return f"Brightness set to {value}." if style == ENGLISH else f"Brightness {value} kar di."
+    if action:
+        return f"Completed {action}." if style == ENGLISH else f"{action} complete kar diya."
+    return "Done." if style == ENGLISH else "Ho gaya."
