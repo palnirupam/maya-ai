@@ -113,16 +113,26 @@ Maya is a privacy-first desktop AI agent that understands natural language comma
 git clone https://github.com/yourusername/maya-ai.git
 cd maya-ai
 
-# Install all dependencies
+# Run automated setup (installs all dependencies)
 npm run install:all
 
-# Configure API key
-# Create .env file in project root:
-echo "GEMINI_API_KEY=your_key_here" > .env
+# Or manually run setup script:
+# PowerShell: .\setup.ps1
+# Git Bash: bash setup.sh (coming soon)
 
-# Launch
+# Configure API key - edit .env file:
+# GEMINI_API_KEY=your_key_here
+
+# Launch Maya
 npm start
 ```
+
+The setup script will:
+1. ✅ Check Python 3.10+ and Node.js 18+ are installed
+2. ✅ Create Python virtual environment in `backend/.venv`
+3. ✅ Install all Python dependencies
+4. ✅ Install all Node.js dependencies (root + frontend)
+5. ✅ Create `.env` file from `.env.example`
 
 Maya will be available at `http://localhost:8000`
 

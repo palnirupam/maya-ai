@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Root package for Maya AI to run frontend and backend concurrently",
   "scripts": {
-    "install:all": "npm install && cd frontend && npm install && cd ../backend && .\\.venv\\Scripts\\activate.bat && pip install -r requirements.txt",
+    "install:all": "powershell -ExecutionPolicy Bypass -File setup.ps1",
     "prestart": "backend\\.venv\\Scripts\\python.exe scratch\\kill_everything.py",
     "start": "concurrently -c \"cyan,magenta\" -n \"backend,frontend\" \"backend\\.venv\\Scripts\\python.exe -m uvicorn backend.api.main:app --host 127.0.0.1 --port 8000\" \"cd frontend && npm run dev\"",
     "start:tauri-services": "concurrently --kill-others-on-fail -c \"cyan,magenta\" -n \"backend,frontend\" \"backend\\.venv\\Scripts\\python.exe -m uvicorn backend.api.main:app --host 127.0.0.1 --port 8000\" \"npm --prefix frontend run dev\"",
