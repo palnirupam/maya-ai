@@ -260,30 +260,6 @@ Maya employs a specialized agent architecture:
 
 ---
 
-## Comparison with Similar Systems
-
-| Feature | Maya | OpenClaw | Hermes Agent |
-|---------|------|----------|--------------|
-| **Messaging Platforms** | Telegram, WhatsApp | WhatsApp, Slack, Signal, others | 20+ platforms |
-| **Desktop Control** | ✅ Full (volume, WiFi, BT, power) | ❌ Limited | ❌ Basic |
-| **Camera/Vision** | ✅ Outfit analysis, object recognition | ❌ | ❌ |
-| **Wallpaper Management** | ✅ Theme-based with learning | ❌ | ❌ |
-| **Indian Language Support** | ✅ Native Banglish/Hindilish | ❌ English only | ⚠️ Limited |
-| **Multi-Intent Execution** | ✅ Advanced | ❌ Sequential only | ✅ |
-| **Local Execution** | ✅ | ✅ | ✅ |
-| **Voice I/O** | ✅ Multilingual | ❌ | ✅ English |
-| **Self-Improvement** | Roadmap | ❌ | ✅ |
-| **Calendar Integration** | Roadmap | ❌ | ✅ |
-| **Cron Scheduler** | Roadmap | ❌ | ✅ |
-
-**Maya's Competitive Edge:**
-- Superior Windows desktop integration
-- First-class Indian language support
-- Advanced vision capabilities
-- Granular system control
-
----
-
 ## Configuration
 
 ### Environment Variables
