@@ -344,5 +344,5 @@ async def test_legacy_shutdown_confirmation_uses_unified_pc_result():
 
     pc.assert_called_once_with(action="shutdown")
     sent_text = manager._send_message.call_args.args[1]
-    assert "execute করা যায়নি" in sent_text
-    assert "৫ সেকেন্ডের মধ্যে PC বন্ধ হবে" not in sent_text
+    assert ("Shutdown execute" in sent_text or "Could not execute shutdown" in sent_text)
+    assert "5 second" not in sent_text and "5 seconds" not in sent_text

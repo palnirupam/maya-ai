@@ -85,6 +85,14 @@ class TestParseDirectOsAction(unittest.TestCase):
         result = _parse_direct_os_action("unlock the door")
         self.assertNotEqual(result, ("perform_shortcut", {"action": "lock"}, None, "PC lock kore dilam."))
 
+    def test_camera_photo(self):
+        for text in ("Take photo", "click a picture", "selfie tule dao"):
+            with self.subTest(text=text):
+                func, kwargs, control, display_msg = _parse_direct_os_action(text)
+                self.assertEqual((func, kwargs), ("pc", {"action": "camera_photo"}))
+                self.assertIsNone(control)
+                self.assertIsNone(display_msg)
+
     def test_battery_status(self):
         func, kwargs, _, display_msg = _parse_direct_os_action("battery koto ache")
         self.assertEqual((func, kwargs), ("pc", {"action": "battery"}))

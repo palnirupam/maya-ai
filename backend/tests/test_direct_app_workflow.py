@@ -1,6 +1,43 @@
 import pytest
 
 from backend.brain.agents import agent_team
+from backend.brain.agents import _workflow as workflow
+
+
+@pytest.mark.asyncio
+async def test_take_photo_bypasses_llm_and_canvas(monkeypatch):
+    async def fail_generate_response(*args, **kwargs):
+        raise AssertionError("Router LLM should not run for a camera shutter command")
+
+    async def fail_generate_stream(*args, **kwargs):
+        raise AssertionError("Agent LLM/Canvas should not run for a camera shutter command")
+        yield
+
+    monkeypatch.setattr(workflow.gemini_adapter, "generate_response", fail_generate_response)
+    monkeypatch.setattr(workflow.gemini_adapter, "generate_stream", fail_generate_stream)
+    monkeypatch.setattr(workflow, "_is_pref_true", lambda key: True)
+    monkeypatch.setattr(
+        "backend.tools.system.camera.take_camera_photo",
+        lambda: "OK: Photo tule save kore dilam: C:\\Pictures\\Camera Roll\\photo.jpg",
+    )
+
+    history = []
+    chunks = [
+        chunk
+        async for chunk in agent_team.execute_workflow(
+            "camera-photo-session",
+            "Take photo",
+            history,
+        )
+    ]
+
+    assert chunks[-1].startswith("OK: Photo tule save kore dilam:")
+    assert history[-3] == {
+        "role": "tool_call",
+        "name": "pc",
+        "args": {"action": "camera_photo"},
+    }
+    assert all(item.get("name") != "update_canvas" for item in history if isinstance(item, dict))
 
 
 def test_parse_direct_app_action_extracts_app_name():
@@ -51,6 +88,11 @@ def test_parse_direct_app_action_extracts_app_name():
     assert agent_team._parse_direct_app_action("whatsapp e message pathao") is None
     assert agent_team._parse_direct_app_action("app open korte perche na keno") is None
     assert agent_team._parse_direct_app_action("open notepad & calc") is None
+    assert agent_team._parse_direct_app_action(
+        "Open koro Open.html file ta browser e"
+    ) is None
+    assert agent_team._parse_direct_app_action("Hochhe na open") is None
+    assert agent_team._parse_direct_app_action("PDF open hocche na") is None
     assert agent_team._parse_direct_app_action(
         r"open C:\Windows\System32\notepad.exe"
     ) is None
@@ -483,3 +525,82 @@ async def test_direct_app_fast_path_respects_system_permission(monkeypatch):
     ]
 
     assert chunks[-1] == "System controls are disabled."
+
+
+@pytest.mark.asyncio
+async def test_open_unknown_app_requires_approval(monkeypatch):
+    # STT noise like "please open oneself" parses as an open_app command but the
+    # target isn't a real app — it must prompt for approval, not launch blindly.
+    monkeypatch.setattr(agent_team, "_is_pref_true", lambda key: True)
+    monkeypatch.setattr(
+        agent_team.tool_planner,
+        "queue_tool",
+        lambda name, payload, risk_level: {
+            "request_id": "unknown-open-request",
+            "tool_name": name,
+            "payload": payload,
+            "risk_level": "HIGH",
+        },
+    )
+
+    async def deny(_request_id):
+        return False
+
+    monkeypatch.setattr(agent_team.tool_planner, "wait_for_approval", deny)
+    monkeypatch.setattr(
+        "backend.tools.desktop.apps.open_app",
+        lambda app_name: pytest.fail("unknown app launched without approval"),
+    )
+
+    history = []
+    chunks = [
+        chunk
+        async for chunk in agent_team.execute_workflow(
+            "unknown-open-session",
+            "please open oneself",
+            history,
+        )
+    ]
+
+    requests = [chunk for chunk in chunks if isinstance(chunk, dict)]
+    assert requests[-1]["type"] == "tool_call_request"
+    assert requests[-1]["data"]["payload"] == {"app_name": "oneself"}
+    assert "chinte parlam na" in chunks[-1]
+    assert history[-2]["content"].startswith("Permission denied:")
+
+
+@pytest.mark.asyncio
+async def test_open_known_app_skips_approval(monkeypatch):
+    # A recognized app (in APP_REGISTRY) must launch immediately with no prompt.
+    monkeypatch.setattr(agent_team, "_is_pref_true", lambda key: True)
+    monkeypatch.setattr(
+        agent_team.tool_planner,
+        "queue_tool",
+        lambda *a, **k: pytest.fail("known app should not require approval"),
+    )
+
+    def fake_open_app(app_name):
+        return f"SUCCESS: Launched {app_name}."
+
+    monkeypatch.setattr("backend.tools.desktop.apps.open_app", fake_open_app)
+
+    history = []
+    chunks = [
+        chunk
+        async for chunk in agent_team.execute_workflow(
+            "known-open-session",
+            "Open notepad",
+            history,
+        )
+    ]
+
+    # No approval prompt should be emitted for a recognized app (the queue_tool
+    # monkeypatch above would fail the test if approval were requested). A status
+    # dict is still emitted normally, so assert only that none is a request.
+    requests = [
+        chunk
+        for chunk in chunks
+        if isinstance(chunk, dict) and chunk.get("type") == "tool_call_request"
+    ]
+    assert requests == []
+    assert chunks[-1] == "notepad open kore dilam."

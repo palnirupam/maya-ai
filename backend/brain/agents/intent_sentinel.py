@@ -13,6 +13,26 @@ class IntentDecision:
     reason: str
     suggested_action: Optional[str] = None
 
+from ..language_style import BANGLISH, HINDILISH, get_latest_conversation_style
+
+_SENTINEL_COPY = {
+    "mode_required": {
+        BANGLISH: "Ei kaj-ta korte Professional Mode ba Coding Mode lagbe. Ami ki mode change korbo?",
+        HINDILISH: "Yeh kaam karne ke liye Professional Mode ya Coding Mode chahiye. Kya main mode change karu?",
+        "english": "This action requires Professional Mode or Coding Mode. Should I switch mode?",
+    },
+    "danger_blocked": {
+        BANGLISH: "Ei obbhoot-purbo bipodjok command-ta system-er khoti korte pare, tai eta block kora hoyeche.",
+        HINDILISH: "Yeh khatarnak command system ko nuksan pahuncha sakta hai, isliye ise block kiya gaya hai.",
+        "english": "This dangerous command could damage the system and has been blocked for safety.",
+    },
+    "capability_missing": {
+        BANGLISH: "Apnar bortoman settingse ei command-ti chalanor onumoti nei. Doya kore settings check korun.",
+        HINDILISH: "Aapki current settings me is command ko chalane ki permission nahi hai. Kripya settings check karein.",
+        "english": "You do not have permission to execute this command in your current settings. Please check settings.",
+    },
+}
+
 class IntentSentinel:
     """
     Layer 0: The Intent Sentinel.
@@ -36,7 +56,7 @@ class IntentSentinel:
     )
 
     @classmethod
-    def evaluate(cls, user_text: str, active_mode: str, capabilities: List[str]) -> IntentDecision:
+    def evaluate(cls, user_text: str, active_mode: str, capabilities: List[str], style: Optional[str] = None) -> IntentDecision:
         """
         Evaluate if the user's text implies an unsafe action.
         If unsafe and the current mode/capabilities don't allow it, block it.
@@ -46,12 +66,14 @@ class IntentSentinel:
         if not is_unsafe_intent:
             return IntentDecision(status="allow", reason="Intent appears safe based on heuristics.")
             
+        current_style = style if style in _SENTINEL_COPY["mode_required"] else get_latest_conversation_style()
+
         # The intent appears unsafe. Check if current mode permits it.
         if active_mode.lower() == "friendly":
             return IntentDecision(
                 status="block",
                 reason="Unsafe action detected in friendly mode.",
-                suggested_action="এই কাজটা করতে Professional Mode বা Coding Mode লাগবে। আমি কি মোড চেঞ্জ করবো?"
+                suggested_action=_SENTINEL_COPY["mode_required"].get(current_style, _SENTINEL_COPY["mode_required"]["english"])
             )
             
         # Critical system-destruction commands are blocked unconditionally
@@ -63,7 +85,7 @@ class IntentSentinel:
             return IntentDecision(
                 status="block",
                 reason="System destruction command detected and blocked for safety.",
-                suggested_action="এই অত্যন্ত বিপজ্জনক কমান্ডটি সিস্টেমের ক্ষতি করতে পারে, তাই এটি ব্লক করা হয়েছে।"
+                suggested_action=_SENTINEL_COPY["danger_blocked"].get(current_style, _SENTINEL_COPY["danger_blocked"]["english"])
             )
 
         # If in professional mode, but terminal/filesystem execution isn't in capabilities
@@ -71,18 +93,9 @@ class IntentSentinel:
              return IntentDecision(
                 status="block",
                 reason="Unsafe action detected but capability is missing.",
-                suggested_action="আপনার বর্তমান সেটিংসে এই কমান্ডটি চালানোর অনুমতি নেই। দয়া করে সেটিংস চেক করুন।"
+                suggested_action=_SENTINEL_COPY["capability_missing"].get(current_style, _SENTINEL_COPY["capability_missing"]["english"])
             )
             
-        # NOTE: power actions (shutdown/restart/reboot/poweroff) are deliberately
-        # NOT gated here. This Sentinel can only "allow"/"block" a request before
-        # it ever reaches a tool call — it has no mechanism to pause execution
-        # and resume once the user replies, so a "needs_approval" verdict here
-        # was previously a dead end (the user was asked "Yes/No?" but a "Yes"
-        # reply started a brand-new turn with no memory of the pending action,
-        # so the shutdown never actually happened). The real, working approval
-        # gate for these actions is the DANGER_TOOLS check in agent_team.py,
-        # which intercepts the actual pc(action=...)/perform_shortcut(action=...)
-        # tool call and drives a real tool_call_request/approve-deny round trip.
         return IntentDecision(status="allow", reason="Unsafe intent detected, but permitted in current mode and capabilities.")
+
 

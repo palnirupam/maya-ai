@@ -14,6 +14,10 @@ from backend.brain.agents.agent_team import _fast_route, _CANVAS_PATTERNS
 
 
 class TestFastRouteSystemControl(unittest.TestCase):
+    def test_camera_photo_routes_to_os_not_canvas(self):
+        self.assertEqual(_fast_route("Take photo"), ["OS_EXECUTOR"])
+        self.assertEqual(_fast_route("click a picture"), ["OS_EXECUTOR"])
+
     def test_lock_routes_to_os_executor(self):
         self.assertEqual(_fast_route("PC lock koro"), ["OS_EXECUTOR"])
         self.assertEqual(_fast_route("লক করো"), ["OS_EXECUTOR"])
@@ -106,6 +110,20 @@ class TestShortMessageRouting(unittest.TestCase):
         # A short question should still fall through so the LLM/Gemini router can
         # decide; previously the unreachable branch would have forced CHAT here.
         self.assertIsNone(_fast_route("ki?"))
+
+    def test_bare_document_routes_to_file_capable_os_agent(self):
+        self.assertEqual(_fast_route("Document"), ["OS_EXECUTOR"])
+        self.assertEqual(_fast_route("Documents"), ["OS_EXECUTOR"])
+
+    def test_file_list_selection_stays_with_os_agent(self):
+        self.assertEqual(
+            _fast_route("3 tai", last_agent="OS_EXECUTOR"),
+            ["OS_EXECUTOR"],
+        )
+        self.assertEqual(
+            _fast_route("all three", last_agent="OS_EXECUTOR"),
+            ["OS_EXECUTOR"],
+        )
 
 
 class TestCanvasPatternFalsePositive(unittest.TestCase):

@@ -33,6 +33,50 @@ def test_unified_file_actions_round_trip_on_real_temp_data(tmp_path):
     assert not renamed.exists()
 
 
+@pytest.mark.parametrize("filename", ["Open.html", "report.pdf", "photo.png"])
+def test_open_launches_browser_supported_file_by_exact_path(tmp_path, monkeypatch, filename):
+    target = tmp_path / filename
+    target.write_text("browser payload", encoding="utf-8")
+    opened = []
+    monkeypatch.setattr(
+        "backend.tools.unified.handlers.file_ops.webbrowser.open",
+        lambda url, new=0: opened.append((url, new)) or True,
+    )
+
+    result = handle_file("open", src=str(target))
+
+    assert result == f"OK: opened {target} in the default browser"
+    assert opened == [(target.resolve().as_uri(), 2)]
+
+
+def test_open_finds_a_named_file_before_launching(tmp_path, monkeypatch):
+    target = tmp_path / "Open.html"
+    target.write_text("<h1>Maya</h1>", encoding="utf-8")
+    monkeypatch.setattr(path_utils, "get_known_folders", lambda: [str(tmp_path)])
+    monkeypatch.setattr(path_utils.string, "ascii_uppercase", "")
+    opened = []
+    monkeypatch.setattr(
+        "backend.tools.unified.handlers.file_ops.webbrowser.open",
+        lambda url, new=0: opened.append(url) or True,
+    )
+
+    result = handle_file("open", name="Open.html")
+
+    assert result == f"OK: opened {target} in the default browser"
+    assert opened == [target.resolve().as_uri()]
+
+
+def test_open_rejects_executable_and_does_not_launch(tmp_path, monkeypatch):
+    target = tmp_path / "unsafe.exe"
+    target.write_bytes(b"MZ")
+    monkeypatch.setattr(
+        "backend.tools.unified.handlers.file_ops.webbrowser.open",
+        lambda *args, **kwargs: pytest.fail("unsupported files must not be launched"),
+    )
+
+    assert handle_file("open", src=str(target)) == "ERR: .exe is not supported for browser opening"
+
+
 def test_write_dedupes_instead_of_silently_overwriting(tmp_path):
     target = tmp_path / "report.txt"
     target.write_text("original", encoding="utf-8")

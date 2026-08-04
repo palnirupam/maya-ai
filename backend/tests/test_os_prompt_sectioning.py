@@ -114,6 +114,13 @@ class TestFileBlock(unittest.TestCase):
         # The fallback manual must also know the `file` tool exists.
         self.assertIn('file(action="write"', OS_EXECUTOR_PROMPT)
 
+    def test_document_open_flow_requires_real_listing_and_tool_calls(self):
+        for prompt in (compose_os_prompt("Document"), OS_EXECUTOR_PROMPT):
+            self.assertIn("Never invent filenames", prompt)
+            self.assertIn("once for EACH file", prompt)
+            self.assertIn("NEVER pass the complaint to open_app", prompt)
+            self.assertIn("result starts with OK", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

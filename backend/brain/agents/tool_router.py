@@ -49,6 +49,7 @@ ALWAYS_INCLUDE = {
     # cheap schema that covers ~20 controls; cross-lingual queries ("blootooth
     # on koro") rank poorly against its signature, so never let it drop.
     "pc",
+    "capture_camera_preview",
 }
 
 # When the user explicitly asks to send/deliver something, these "final delivery"
@@ -84,7 +85,7 @@ _SEND_INTENT_RE = re.compile(
 # turns like volume/brightness.
 _FILE_TOOLS = {"file", "create_pdf"}
 _FILE_INTENT_RE = re.compile(
-    r"\bfiles?\b|\bfolders?\b|ফাইল|ফোল্ডার"
+    r"\bfiles?\b|\bfolders?\b|\bdocuments?\b|\bdownloads?\b|ফাইল|ফোল্ডার"
     r"|\.txt|\.md|\.csv|\.json|\.log|\.pdf|\bpdf\b|\.docx?|\.xlsx?|\.py|\.html?"
     r"|text file|save.*(desktop|documents|downloads|\.txt|file|folder)"
     r"|desktop e save|documents e save|save.*desktop"

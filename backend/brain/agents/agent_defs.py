@@ -74,11 +74,13 @@ AGENTS:
   DO NOT route YouTube data analysis or comment fetching here. Send those to OS_EXECUTOR.
 
 - CODER: Use ONLY for actual file system operations or running scripts in terminal.
-  Examples: "ei Python file ta run koro", "script likho disk cleanup er jonno", "file poro".
-  DO NOT use CODER for visual widgets, trackers, dashboards, or any canvas/UI request.
+  Examples: "ei Python file ta run koro", "script likho disk cleanup er jonno", "file poro",
+  "D drive e game.html banao", "C:\\\\... e file save koro", "Desktop e .html file create koro".
+  DO NOT use CODER for pure visual widgets/games with no file path specified.
 
 STRICT RULE: If the message is a question or casual conversation → always use CHAT.
-STRICT RULE: If user asks to BUILD/CREATE any visual tool, widget, tracker, game, dashboard → always use CHAT.
+STRICT RULE: If user asks to BUILD/CREATE any visual tool, widget, tracker, game, dashboard WITHOUT mentioning a specific drive or file path → always use CHAT.
+STRICT RULE: If user mentions a drive ("D drive", "C drive") or a file path/extension with the create request → use CODER to create a real file on disk. NOT CHAT.
 STRICT RULE: Mode CHANGE (e.g. "friendly mode e jao") → OS_EXECUTOR. Mode QUESTION (e.g. "kon mode e acho?") → CHAT.
 
 Return format: {"agents": ["CHAT"]} or {"agents": ["OS_EXECUTOR"]} etc.
@@ -123,10 +125,13 @@ FILE OPERATIONS — use the `file` tool (runs in the background, no window neede
 - To RUN code use execute_python / execute_powershell.
 
 CRITICAL — CANVAS vs FILE distinction:
-- If the user asks to BUILD/CREATE a visual tool (tracker, dashboard, widget, calculator, game, kanban board),
-  you MUST call update_canvas(html, css, js) with complete self-contained HTML/CSS/JS code.
-  DO NOT create .md or .txt files for visual requests. DO NOT use the file tool for UI widgets.
-- Only use file(action="write")/execute_python/execute_powershell for actual script/code file tasks.
+- If the user asks to BUILD/CREATE a visual tool (tracker, dashboard, widget, calculator, game, kanban board)
+  WITHOUT specifying a file path or drive letter → call update_canvas(html, css, js).
+- If the user specifies a DRIVE or PATH (e.g. "D drive e save koro", "D:\\game.html", "Desktop e banao"),
+  you MUST create a real file using file(action="write", src="<absolute path>", dst="<full HTML content>").
+  DO NOT call update_canvas for this case. Create the actual .html file on disk.
+- NEVER say "ami file create korte pari na" — you have the `file` tool and CAN always create files.
+- Only use execute_python/execute_powershell for actual script/code execution tasks.
 """ + ANTI_HALLUCINATION_BLOCK
 
 OS_EXECUTOR_PROMPT = """You are the OS Executor Agent for Maya AI.
@@ -211,6 +216,34 @@ YOUR ONLY JOB: Execute desktop actions on the Windows computer.
   * To set volume to a percentage → ALWAYS use change_volume(level) tool. e.g. change_volume(20) for 20%.
   * To mute/unmute → use perform_shortcut('mute').
   * NEVER use type_text or press_key to control volume. NEVER type numbers for volume.
+- WALLPAPER / THEME CUSTOMIZATION (CRITICAL):
+  * To change desktop wallpaper → pc(action="theme_wallpaper", name="<full_image_path>", state="<theme_name>").
+    Example: pc(action="theme_wallpaper", name="C:\\Users\\palni\\Downloads\\wallpaper.jpg", state="hacker").
+  * If the user asks for a themed wallpaper (e.g. "hacker wallpaper lagao", "Srikrishna er wallpaper dao", "nature wallpaper"):
+    - STEP 1: Download the image from internet to Downloads folder using web search + download.
+    - STEP 2: Call pc(action="theme_wallpaper", name=<downloaded_path>, state=<theme>) immediately.
+  * For dark mode → pc(action="theme_dark", val=1). Light mode → pc(action="theme_dark", val=0).
+  * For accent color → pc(action="theme_accent", name="<hex>") e.g. "FF0000" for red, "00FF00" for green.
+  * CRITICAL: "wallpaper" means DESKTOP BACKGROUND, NOT camera photo. NEVER open Camera app for wallpaper requests.
+  * CRITICAL: Words like "wallpaper lagao", "wallpaper set koro", "wallpaper change koro" = desktop background change.
+  * WALLPAPER FEEDBACK HANDLING (VERY IMPORTANT):
+    - If user says "valo lagche na", "pasondo hoyni", "eta na", "bhalo na", "bhalo hoyni", "valo na", "like na", "change koro", "onno wallpaper dao", "different wallpaper",
+      OR in English: "don't like", "not good", "doesn't look good", "change it", "try another", "different one",
+      OR in Hindilish: "accha nahi hai", "pasand nahi", "badal do", "dusra lagao", "ye nahi chahiye":
+      → Call pc(action="wallpaper_dislike", name="<current_theme>") to download & set different wallpaper from SAME theme.
+    - If user says "agerta better chilo", "purano ta bhalo chilo", "age wala", "previous", "restore koro", "undo koro", "firiye dao",
+      OR in English: "previous was better", "go back", "undo", "restore previous", "old one was good",
+      OR in Hindilish: "pehla wala accha tha", "purana wala", "wapas karo", "pichla wala":
+      → Call pc(action="wallpaper_restore") to restore previous wallpaper from history.
+    - If user says "onno theme dao", "different type", "suggest koro", "suggestion dao", "ki ki ache", "options dekhao",
+      OR in English: "show options", "what else", "suggest something", "give suggestions", "other themes",
+      OR in Hindilish: "aur kya hai", "options dikhao", "suggest karo", "dusra theme":
+      → Call pc(action="wallpaper_suggest", name="<current_theme>") to get alternative theme suggestions, then download one.
+    - If user says "wallpaper ta sundor", "etake bhalo lagche", "khub sundor", "darun", "awesome", "perfect", "valo lagche",
+      OR in English: "looks good", "I like it", "nice", "beautiful", "great", "perfect",
+      OR in Hindilish: "accha hai", "pasand hai", "bahut accha", "zabardast", "mast hai":
+      → Call pc(action="wallpaper_like") to remember this preference.
+    - NEVER just say "okay" or "আমি একটা AI" when user gives wallpaper feedback. ALWAYS take action using these tools.
 - BLUETOOTH / WIFI (CRITICAL — use the pc tool, NEVER open Settings UI for these):
   * Bluetooth on/off → pc(action="bt_toggle", state="on" or "off"). Status → pc(action="bt_status").
   * Paired devices → pc(action="bt_list"). Unpair → pc(action="bt_remove", name="...").
@@ -228,6 +261,7 @@ YOUR ONLY JOB: Execute desktop actions on the Windows computer.
   * List running processes → pc(action="process_list"). Kill a process → pc(action="process_kill", name="..." or val=pid)
     — this always requires explicit user approval before it runs; tell the user you're waiting for it if asked.
   * Clipboard read/write → pc(action="clipboard_read") / pc(action="clipboard_write", name="text").
+  * Take/click a camera photo → pc(action="camera_photo"). Camera app open thakte hobe; real tool result report koro.
   * Report the tool's REAL result: if it returns ERR, tell the user it failed — never claim success.
 - You have been given context from previous agents. Use that context as the message content.
 - ALWAYS attempt the action using tools. NEVER say "I cannot send" or "please do it yourself."
@@ -382,7 +416,18 @@ _OS_BLOCK_SYSTEM_CONTROL = """- SYSTEM POWER / STATUS (CRITICAL — these are RE
   * List running processes → pc(action="process_list"). Kill a process → pc(action="process_kill", name="..." or val=pid)
     — this always requires explicit user approval before it runs; tell the user you're waiting for it if asked.
   * Clipboard read/write → pc(action="clipboard_read") / pc(action="clipboard_write", name="text").
+  * Take/click a camera photo → pc(action="camera_photo"). Camera app open thakte hobe; real tool result report koro.
   * Report the tool's REAL result: if it returns ERR, tell the user it failed — never claim success."""
+
+_OS_BLOCK_CAMERA_VISION = """- CAMERA / REAL-WORLD VISUAL QUESTIONS (CRITICAL):
+  * If the user asks how they look, how today's outfit/dress/style looks, whether clothing matches,
+    or asks for any opinion that requires seeing them, you MUST call capture_camera_preview().
+  * capture_camera_preview opens/focuses the real Windows Camera app and sends the current preview
+    into the next vision reasoning round. Never answer from imagination, chat history, or a desktop screenshot.
+  * After the preview arrives, inspect only what is actually visible. Give a respectful, concrete opinion
+    about outfit colors, coordination, fit, and overall presentation. If the person or outfit is not clearly
+    visible, say that precisely and ask them to adjust the camera; never guess.
+  * Do not click the shutter unless the user explicitly asks to take/save a photo."""
 
 _OS_BLOCK_FILE = """- FILE / FOLDER OPERATIONS (CRITICAL — use the `file` tool; it works directly in the background, NO File Explorer / Notepad / PowerShell window needed):
   * Save/write a text file → file(action="write", src="<absolute path>", dst="<full text content>").
@@ -431,7 +476,7 @@ The screenshot will automatically be fed to your next reasoning step as a real i
 # Ordered so composed prompts read in the same sequence as the monolith.
 _OS_BLOCK_ORDER = [
     "whatsapp", "email", "pdf", "mcp", "chrome_profile", "youtube", "volume",
-    "connectivity", "system_control", "file", "gui_automation",
+    "connectivity", "system_control", "camera_vision", "file", "gui_automation",
 ]
 OS_CAPABILITY_BLOCKS = {
     "whatsapp": _OS_BLOCK_WHATSAPP,
@@ -443,6 +488,7 @@ OS_CAPABILITY_BLOCKS = {
     "volume": _OS_BLOCK_VOLUME,
     "connectivity": _OS_BLOCK_CONNECTIVITY,
     "system_control": _OS_BLOCK_SYSTEM_CONTROL,
+    "camera_vision": _OS_BLOCK_CAMERA_VISION,
     "file": _OS_BLOCK_FILE,
     "gui_automation": _OS_BLOCK_GUI_AUTOMATION,
 }
@@ -467,6 +513,13 @@ _OS_BLOCK_GATES = {
         r"|\bhibernate\b|sleep mode|pc.{0,4}sleep|laptop.{0,4}sleep"
         r"|\bbattery\b|ব্যাটারি|charge koto|\bstats?\b|cpu usage|ram usage|system stats"
         r"|clipboard|\bprocess(es)?\b|kill.*process|task.*kill",
+        _re.IGNORECASE,
+    ),
+    "camera_vision": _re.compile(
+        r"\b(outfit|dress|clothes|clothing|shirt|tshirt|t-shirt|style|matching)\b"
+        r".{0,60}\b(how|kemon|kamon|kaisa|kaisi|lagche|lagchhe|lag raha|lag rahi|look|think|opinion|match)\b"
+        r"|\b(how|what)\b.{0,45}\b(outfit|dress|clothes|clothing|shirt|tshirt|t-shirt|style)\b"
+        r"|\b(how do i look|how am i looking|kemon lagche|kamon lagche|kaisa lag raha|kaisi lag rahi)\b",
         _re.IGNORECASE,
     ),
     # File/folder ops. Deliberately NOT gated on a bare "save" (that would steal
@@ -571,6 +624,7 @@ AGENT_TOOLS_MAPPING = {
         "configure_gmail_credentials", "configure_mcp_server", "create_pdf", "send_background_email", "read_background_email", "gmail_action", "trash_background_email", "permanent_delete_email",
         "pause_media", "setup_missing_tool", "find_and_click", "wait_for_element",
         "take_verified_screenshot", "read_on_screen_text",
+        "capture_camera_preview",
         "read_clipboard", "write_clipboard",
         "get_active_windows", "manage_processes",
         # Background computer use — no mouse, no focus stealing
@@ -579,8 +633,6 @@ AGENT_TOOLS_MAPPING = {
         # Unified system router — volume/brightness/lock/processes + WiFi + Bluetooth
         # (one schema instead of ~20 individual tools: token-cheap, high control)
         "pc",
-        # Canvas — OS_EXECUTOR can trigger canvas for complex interactive dashboards
-        "update_canvas",
     ],
 
     # CHAT gets update_canvas so it can directly render widgets from conversation

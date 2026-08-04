@@ -1,5 +1,9 @@
 from backend.api.telegram_bot import TelegramBotManager
-from backend.voice.input.desktop_listener import DesktopMicrophoneListener
+from backend.voice.input.desktop_listener import (
+    DEFAULT_NATIVE_MIC_LOCKED,
+    MIN_BARGE_IN_THRESHOLD,
+    DesktopMicrophoneListener,
+)
 from backend.voice.voice_state_machine import VoiceStateMachine
 
 
@@ -8,6 +12,33 @@ def _listener_without_audio_dependencies() -> DesktopMicrophoneListener:
     listener._is_locked = False
     listener._remote_suppression_count = 0
     return listener
+
+
+def test_native_microphone_defaults_to_locked(monkeypatch) -> None:
+    from backend.voice.vad import silero
+
+    monkeypatch.setattr(silero, "vad", object())
+    listener = DesktopMicrophoneListener(state_machine=object())
+
+    assert DEFAULT_NATIVE_MIC_LOCKED is True
+    assert listener.is_locked
+    assert listener.is_manually_locked
+
+
+def test_silent_calibration_keeps_nonzero_threshold() -> None:
+    import numpy as np
+
+    class SilentStream:
+        def read(self, samples):
+            return np.zeros((samples, 1), dtype=np.float32), False
+
+    listener = _listener_without_audio_dependencies()
+    listener._stream = SilentStream()
+    listener._barge_in_threshold = 0.02
+
+    listener._calibrate_ambient_noise()
+
+    assert listener._barge_in_threshold == MIN_BARGE_IN_THRESHOLD
 
 
 def test_remote_suppression_does_not_change_manual_lock() -> None:
