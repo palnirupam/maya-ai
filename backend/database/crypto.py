@@ -15,6 +15,9 @@ class KeyUnreadableError(Exception):
     """Raised when data cannot be decrypted due to hardware key mismatch or DPAPI failure."""
     pass
 
+recovery_required = False
+
+
 
 class _DATA_BLOB(ctypes.Structure):
     _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
@@ -137,6 +140,7 @@ def _candidate_fingerprints() -> list[str]:
 
 
 def _load_salt() -> bytes:
+    global recovery_required
     if SALT_FILE.exists():
         with open(SALT_FILE, "rb") as f:
             raw = f.read()
@@ -146,7 +150,8 @@ def _load_salt() -> bytes:
             # Fallback if unencrypted legacy salt exists
             if len(raw) == 16:
                 return raw
-            raise
+            recovery_required = True
+            return os.urandom(16)
     salt = os.urandom(16)
     SALT_FILE.parent.mkdir(parents=True, exist_ok=True)
     encrypted_salt = win_dpapi_encrypt(salt)

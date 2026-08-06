@@ -385,9 +385,8 @@ async def websocket_endpoint(websocket: WebSocket):
         t_total = time.time()
         logger.info(f"Total time from speech end to last audio chunk: {t_total - t_speech_end:.2f}s")
         await manager.send_personal_event("status_update", {"appState": "idle"}, websocket)
-        # Signal frontend that Maya has finished speaking — voice session loop can restart
         await manager.send_personal_event("session_ready", {}, websocket)
-        
+
         # Cleanup tasks from active list
         if session_id in active_tasks:
             current_task = asyncio.current_task()

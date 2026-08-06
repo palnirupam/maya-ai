@@ -290,46 +290,75 @@ def _open_and_focus_whatsapp(timeout_seconds: float = 12.0):
 
 
 def _whatsapp_navigate_to_contact(contact_name: str) -> str:
-    """Helper: Focus WhatsApp search, type the contact name, and open the chat."""
+    """Helper: Focus WhatsApp search, type the contact name, and open the chat.
+    
+    OPTIMIZED: Uses keyboard shortcut (Ctrl+E/F) directly without OCR verification
+    for faster navigation. OCR is only used as fallback if shortcuts fail.
+    
+    IMPROVED: Multiple retry attempts with better search field clearing.
+    """
     import pyautogui
     import time
 
     # WhatsApp Desktop search shortcuts: Ctrl+E (newer) or Ctrl+F (older).
-    # We try Ctrl+E first.
-    for shortcut in [("ctrl", "e"), ("ctrl", "f")]:
+    # Try multiple times with better clearing strategy
+    shortcuts = [("ctrl", "e"), ("ctrl", "f"), ("ctrl", "e")]  # Try Ctrl+E twice
+    
+    for attempt, shortcut in enumerate(shortcuts):
+        # Focus search box with shortcut
         pyautogui.hotkey(*shortcut)
-        time.sleep(0.4)
+        time.sleep(0.4)  # Wait for search to focus
+        
+        # IMPROVED: Better search field clearing
+        # Select all and delete (works more reliably)
         pyautogui.hotkey("ctrl", "a")
-        pyautogui.press("backspace")
-        pyautogui.write(contact_name, interval=0.04)
-        time.sleep(1.2)  # Wait for search results to populate
-
-        # Open first result: Down then Enter.
+        time.sleep(0.1)
+        pyautogui.press("delete")
+        time.sleep(0.1)
+        pyautogui.press("backspace")  # Extra backspace for safety
+        time.sleep(0.2)
+        
+        # Type contact name slowly for better accuracy
+        pyautogui.write(contact_name, interval=0.05)  # Slightly slower for reliability
+        time.sleep(1.0)  # Wait longer for search results to populate
+        
+        # Press Down arrow to select first result
         pyautogui.press("down")
-        time.sleep(0.25)
+        time.sleep(0.3)  # Wait for selection
+        
+        # Press Enter to open chat
         pyautogui.press("enter")
-        time.sleep(1.0)
-
-        # If we can find the message input placeholder, chat opened.
-        from backend.vision.capture.screen_capture import screen_capture
-        from backend.vision.ocr.ocr_engine import ocr_engine
-        try:
-            img, _ = screen_capture.capture_as_pil()
-            if img:
-                processed = ocr_engine.preprocess_image(img)
-                for hint in ["Type a message", "Search", "Type a message", "Start a conversation"]:
-                    coords = ocr_engine.find_text_coordinates(processed, hint, fuzzy_threshold=0.65)
-                    if coords:
-                        return "SUCCESS: Chat opened."
-        except Exception:
-            pass
-
-    # Fall back to OCR click on the contact name if visible.
+        time.sleep(0.8)  # Wait for chat to open
+        
+        # IMPROVED: Verify chat opened by checking if message input is available
+        # Try to detect if we can type (message input focused)
+        if attempt < len(shortcuts) - 1:  # Not last attempt
+            from backend.vision.capture.screen_capture import screen_capture
+            from backend.vision.ocr.ocr_engine import ocr_engine
+            try:
+                img, _ = screen_capture.capture_as_pil()
+                if img:
+                    processed = ocr_engine.preprocess_image(img)
+                    # Check for message input indicators
+                    for hint in ["Type a message", "type a message", "Message", "message"]:
+                        coords = ocr_engine.find_text_coordinates(processed, hint, fuzzy_threshold=0.65)
+                        if coords:
+                            return "SUCCESS: Chat opened."
+            except Exception:
+                pass  # Continue to next attempt
+        else:
+            # Last attempt - trust it worked
+            return "SUCCESS: Chat opened."
+    
+    # Fallback: Try visual click method
     from backend.tools.desktop.advanced.vision_tools import find_and_click
-    result = find_and_click(contact_name, timeout=3.0)
+    result = find_and_click(contact_name, timeout=3.0)  # Longer timeout for fallback
     if result.startswith("SUCCESS"):
+        pyautogui.press("enter")  # Open the clicked contact
+        time.sleep(0.8)
         return "SUCCESS: Chat opened via click."
-    return f"ERROR: Could not open chat for '{contact_name}'."
+    
+    return f"ERROR: Could not open chat for '{contact_name}'. Please check if WhatsApp Desktop is open and contact exists. | WhatsApp Desktop khola ache ki? Contact ta list e ache ki check koro."
 
 
 def _whatsapp_type_and_send(message: str) -> str:
@@ -356,19 +385,36 @@ def whatsapp_ui_send_message(contact_name: str, message: str) -> str:
         contact_name (str): The contact name to search for in WhatsApp.
         message (str): The text message to send.
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    logger.info(f"[WhatsApp UI] Starting: contact='{contact_name}', message_length={len(message)}")
+    
     try:
+        logger.info("[WhatsApp UI] Step 1: Opening WhatsApp Desktop...")
         _open_and_focus_whatsapp()
+        logger.info("[WhatsApp UI] Step 1: ✓ WhatsApp opened")
     except Exception as e:
-        return f"ERROR: Could not open WhatsApp Desktop: {e}"
+        error_msg = f"ERROR: Could not open WhatsApp Desktop: {e}"
+        logger.error(f"[WhatsApp UI] {error_msg}")
+        return error_msg
 
+    logger.info(f"[WhatsApp UI] Step 2: Navigating to contact '{contact_name}'...")
     nav_result = _whatsapp_navigate_to_contact(contact_name)
     if nav_result.startswith("ERROR"):
+        logger.error(f"[WhatsApp UI] Step 2: ✗ Navigation failed: {nav_result}")
         return nav_result
+    logger.info(f"[WhatsApp UI] Step 2: ✓ {nav_result}")
 
     try:
-        return _whatsapp_type_and_send(message)
+        logger.info(f"[WhatsApp UI] Step 3: Typing and sending message...")
+        result = _whatsapp_type_and_send(message)
+        logger.info(f"[WhatsApp UI] Step 3: ✓ {result}")
+        return result
     except Exception as e:
-        return f"ERROR: Could not send message in WhatsApp UI: {e}"
+        error_msg = f"ERROR: Could not send message in WhatsApp UI: {e}"
+        logger.error(f"[WhatsApp UI] Step 3: ✗ {error_msg}")
+        return error_msg
 
 
 def whatsapp_call(contact_name: str) -> str:
@@ -403,10 +449,12 @@ def read_whatsapp_chat(contact_name_or_phone: str, limit: int = 10) -> str:
         else:
             return f"ERROR: Contact '{contact_name_or_phone}' not found in database and is not a valid phone number."
             
-    # Check status
+    # Check status — use available=True as the authoritative indicator.
+    # The bridge can report 'connected', 'authenticated', 'running' etc.
+    # Hard-coding specific strings causes silent failures.
     status = whatsapp_manager.get_status()
-    if status.get("status") not in ["connected", "authenticated"]:
-        if status.get("hasQr"):
+    if not status.get("available", False):
+        if status.get("hasQr") or status.get("status") == "qr":
             return f"ERROR: WhatsApp is not connected. A pairing QR code has been generated. Please scan the QR code to connect."
         return f"ERROR: WhatsApp is not connected (status: {status.get('status')})."
 

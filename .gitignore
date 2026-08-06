@@ -114,3 +114,4 @@ backend/config/mcp_servers.json
 *.pid
 .claude/
 .coverage
+backend/voice/output/kokoro_models/*.onnx

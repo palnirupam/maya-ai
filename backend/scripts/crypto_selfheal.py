@@ -83,7 +83,18 @@ def main():
     total_recovered = total_lost = total_primary = 0
 
     for table, cols in ENCRYPTED_COLUMNS.items():
+        # SQL dynamic table/column names validated against ENCRYPTED_COLUMNS whitelist
+        # This is necessary because SQLAlchemy ORM doesn't support dynamic table/column references
         try:
+            # Validate table and column names contain only safe characters (alphanumeric, underscore)
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', table):
+                logger.error(f"Invalid table name in ENCRYPTED_COLUMNS: {table}")
+                continue
+            for col in cols:
+                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', col):
+                    logger.error(f"Invalid column name in ENCRYPTED_COLUMNS: {col}")
+                    continue
+            
             rows = cur.execute(f"SELECT id, {', '.join(cols)} FROM {table}").fetchall()
         except Exception:
             continue  # table not present in this DB

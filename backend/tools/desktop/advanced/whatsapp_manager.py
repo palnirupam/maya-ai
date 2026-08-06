@@ -272,9 +272,11 @@ class WhatsAppManager:
             return False
 
         logger.info("Spawning WhatsApp Node.js service subprocess...")
+        log_file_opened = False
         try:
             log_path = os.path.abspath(os.path.join(script_dir, "../../../../data/whatsapp_service.log"))
             self.log_file = open(log_path, "a", encoding="utf-8")
+            log_file_opened = True
             env = os.environ.copy()
             env["WA_API_KEY"] = self.api_key
             self.process = subprocess.Popen(
@@ -298,7 +300,9 @@ class WhatsAppManager:
             self._startup_error = "WhatsApp service could not be started."
             logger.error("[WA] %s (%s)", self._startup_error, type(e).__name__)
             self.process = None
-            self._close_log_file()
+            # Ensure log file is closed even if process creation failed
+            if log_file_opened:
+                self._close_log_file()
             return False
 
     def stop(self):
@@ -330,8 +334,14 @@ class WhatsAppManager:
             self._close_log_file()
 
     def wait_for_connected(self, timeout_seconds: int = 90) -> bool:
+        """Poll until WhatsApp bridge is operationally ready to send/receive.
+        
+        Accepts any status that is NOT an error/setup state.
+        Using a reject-list (not an allow-list) means future valid bridge
+        states work automatically without code changes.
+        """
+        _NOT_READY = {"qr", "error", "unavailable", "consent_required", "", None}
 
-        """Poll until WhatsApp is 'connected' or 'authenticated' (both can send). Returns True if ready within timeout."""
         if self._startup_error:
             logger.error("[WA] Cannot wait for WhatsApp: %s", self._startup_error)
             return False
@@ -342,9 +352,9 @@ class WhatsAppManager:
                 resp = httpx.get("http://127.0.0.1:9001/status", timeout=3.0, headers=self._get_headers())
                 if resp.status_code == 200:
                     status = resp.json().get("status", "")
-                    if status in ("connected", "authenticated"):
+                    if status not in _NOT_READY:
                         if poll_count > 0:
-                            logger.info(f"[WA] WhatsApp is ready to send (status={status}).")
+                            logger.info(f"[WA] WhatsApp is ready (status={status}).")
                         return True
                     if poll_count == 0:
                         logger.info(f"[WA] Waiting for WhatsApp (current status: {status})...")

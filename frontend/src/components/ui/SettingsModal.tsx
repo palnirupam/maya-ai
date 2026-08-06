@@ -1,13 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import {
   X, Key, Shield, Lock, Eye, EyeOff,
-  CheckCircle, XCircle, Loader2, Volume2, Send,
+  CheckCircle, XCircle, Loader2, Volume2, Send, Smartphone,
 } from 'lucide-react';
 import { backendHttpUrl } from '../../services/websocket';
 import { requireOk } from '../../services/http';
 
 interface Props { isOpen: boolean; onClose: () => void; }
-type Tab = 'providers' | 'voice' | 'permissions' | 'telegram';
+type Tab = 'providers' | 'voice' | 'permissions' | 'telegram' | 'whatsapp';
 type SaveStatus = 'idle' | 'testing' | 'saving' | 'success' | 'error';
 type ProviderOption = {
   id: string;
@@ -151,18 +151,24 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
       .catch(console.error);
 
     fetch(`${backendHttpUrl}/settings/telegram`)
-      .then(r => r.json())
+      .then(async r => {
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.detail || 'Failed to load Telegram settings');
+        return data;
+      })
       .then(data => {
         setTelegramEnabled(!!data.enabled);
-        if (data.token_configured) {
-          setTelegramConfigured(true);
-          setTelegramToken('••••••••••••••••••••••••••••••••••••••••');
-        }
+        setTelegramConfigured(!!data.token_configured);
+        setTelegramToken(data.token_configured ? '••••••••••••••••••••••••••••••••••••••••' : '');
         setTelegramPaired(!!data.paired);
         setTelegramChatId(data.chat_id || '');
         setTelegramPairingCode(data.pairing_code || '');
+        setTelegramError(data.configuration_error || '');
       })
-      .catch(console.error);
+      .catch(e => {
+        setTelegramError(e?.message || 'Failed to load Telegram settings');
+        console.error(e);
+      });
   }, [isOpen]);
 
   // ── Gemini ─────────────────────────────────────────────────────────────────
@@ -308,7 +314,8 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      if (!r.ok) throw new Error('Failed to save Telegram settings');
+      const saved = await r.json();
+      if (!r.ok) throw new Error(saved.detail || 'Failed to save Telegram settings');
       setTelegramStatus('success');
       if (telegramToken && !telegramToken.includes('•')) {
         setTelegramConfigured(true);
@@ -316,9 +323,13 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
       // Refresh pairing code / status
       const res = await fetch(`${backendHttpUrl}/settings/telegram`);
       const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed to refresh Telegram settings');
+      setTelegramEnabled(!!data.enabled);
+      setTelegramConfigured(!!data.token_configured);
       setTelegramPaired(!!data.paired);
       setTelegramChatId(data.chat_id || '');
       setTelegramPairingCode(data.pairing_code || '');
+      if (data.configuration_error) throw new Error(data.configuration_error);
       setTimeout(() => setTelegramStatus('idle'), 3000);
     } catch (e: any) { setTelegramError(e.message); setTelegramStatus('error'); }
   };
@@ -344,6 +355,7 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
     { id: 'voice',     label: 'Voice & TTS',  icon: <Volume2 size={15} /> },
     { id: 'permissions', label: 'Permissions',  icon: <Shield size={15} /> },
     { id: 'telegram',   label: 'Telegram Bot', icon: <Send size={15} /> },
+    { id: 'whatsapp',   label: 'WhatsApp',     icon: <Smartphone size={15} /> },
   ];
 
   return (
@@ -626,11 +638,18 @@ export const SettingsModal: React.FC<Props> = ({ isOpen, onClose }) => {
               )}
             </div>
           )}
+
+          {/* ── WhatsApp Integration ── */}
+          {activeTab === 'whatsapp' && (
+            <WhatsAppIntegration />
+          )}
         </div>
       </div>
     </div>
   );
 };
+
+import { WhatsAppIntegration } from '../whatsapp/WhatsAppIntegration';
 
 // ── Reusable UI Helpers ───────────────────────────────────────────────────────
 

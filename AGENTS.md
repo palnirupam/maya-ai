@@ -18,6 +18,12 @@ All file operations in one tool:
 - `file("delete_by_name", name="report.pdf", n=5)` — find+delete
 - `file("organize", path="C:/Downloads")` — auto-sort by type
 
+**NEW: Compression (zero API cost)**
+- `file("compress", src="C:/folder", dst="archive.zip")` — create ZIP/TAR archive
+- `file("extract", src="archive.zip", dst="C:/output")` — extract archive
+- `file("list_archive", src="archive.zip")` — list contents without extracting
+- `file("compress_files", name="file1.txt,file2.doc", dst="files.zip")` — compress specific files
+
 ### pc(action, val, name, state, cmd)
 All system control in one tool:
 - `pc("volume", val=70)`
@@ -60,6 +66,30 @@ All system control in one tool:
 - `pc("wallpaper_suggest", name="hacker")` — Get alternative theme suggestions
 - `pc("wallpaper_like")` — Mark current wallpaper as liked (learn preferences)
 
+**NEW: Browser Automation (zero API cost - keyboard shortcuts)**
+- `pc("browser_tab_new")` — Open new browser tab
+- `pc("browser_tab_close")` — Close current tab
+- `pc("browser_tab_next")` — Switch to next tab
+- `pc("browser_tab_prev")` — Switch to previous tab
+- `pc("browser_tab_reopen")` — Reopen last closed tab
+- `pc("browser_tab_switch", val=3)` — Switch to tab number 3
+- `pc("browser_bookmark")` — Bookmark current page
+- `pc("browser_bookmarks")` — Open bookmarks manager
+- `pc("browser_history")` — Open browser history
+- `pc("browser_downloads")` — Open downloads page
+- `pc("browser_find")` — Find in page (Ctrl+F)
+- `pc("browser_refresh")` — Refresh current page
+- `pc("browser_back")` — Navigate back
+- `pc("browser_forward")` — Navigate forward
+- `pc("browser_open_url", name="https://google.com")` — Open URL in default browser
+- `pc("browser_search", name="weather today")` — Search in new tab
+- `pc("browser_fullscreen")` — Toggle fullscreen mode
+- `pc("browser_zoom_in")` — Zoom in
+- `pc("browser_zoom_out")` — Zoom out
+- `pc("browser_zoom_reset")` — Reset zoom to 100%
+- `pc("browser_incognito")` — Open incognito/private window
+- `pc("browser_devtools")` — Open developer tools (F12)
+
 **Usage Example:**
 ```python
 # User: "wallpaper ta valo lagche na"
@@ -70,6 +100,15 @@ pc("wallpaper_restore")  # Restores previous wallpaper
 
 # User: "onno theme suggest koro"
 pc("wallpaper_suggest", name="hacker")  # Returns: "cyberpunk, tech, coding, matrix"
+
+# User: "browser e notun tab kholo"
+pc("browser_tab_new")  # Opens new tab
+
+# User: "Downloads folder compress koro"
+file("compress", src="C:/Users/Downloads", dst="downloads_backup.zip")
+
+# User: "ei zip file er moddhe ki ache?"
+file("list_archive", src="downloads_backup.zip")
 ```
 
 ## Legacy Tools (still available)

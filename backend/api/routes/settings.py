@@ -29,6 +29,10 @@ import httpx
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/settings", tags=["settings"])
 
+
+class RecoveryPayload(BaseModel):
+    old_key: str | None = None
+
 def _model_for_provider(provider: str, stored_model: str | None) -> str:
     return model_for_provider(provider, stored_model, get_model)
 
@@ -160,6 +164,77 @@ def _save_pref(db: Session, key: str, value: str):
 
 # ── Status ────────────────────────────────────────────────────────────────────
 
+@router.get("/status/app")
+def get_app_status(db: Session = Depends(get_db)):
+    """Compatibility endpoint expected by the frontend recovery flow."""
+    try:
+        from ...database.crypto import KeyUnreadableError
+    except Exception:
+        KeyUnreadableError = Exception
+
+    try:
+        # If any stored preference cannot be decrypted with the current key, the
+        # app should surface the recovery modal to let the user provide a legacy key.
+        gemini_pref = db.query(UserPreferences).filter(UserPreferences.key == "GEMINI_API_KEY").first()
+        if gemini_pref and gemini_pref.value:
+            crypto_manager.decrypt(gemini_pref.value, raise_on_failure=True)
+        elevenlabs_pref = db.query(UserPreferences).filter(UserPreferences.key == "ELEVENLABS_API_KEY").first()
+        if elevenlabs_pref and elevenlabs_pref.value:
+            crypto_manager.decrypt(elevenlabs_pref.value, raise_on_failure=True)
+    except KeyUnreadableError:
+        return {"recovery_required": True, "detail": "Stored credentials are unreadable with the current key."}
+    except Exception:
+        # Conservatively return false unless the current crypto layer explicitly flags a mismatch.
+        pass
+
+    return {"recovery_required": False}
+
+
+@router.post("/recover")
+def recover_from_legacy_key(payload: RecoveryPayload, db: Session = Depends(get_db)):
+    """Recover encrypted preferences using a legacy Fernet key provided by the user."""
+    old_key = (payload.old_key or "").strip()
+    if not old_key:
+        raise HTTPException(status_code=400, detail="A legacy key is required.")
+
+    from cryptography.fernet import Fernet, InvalidToken
+
+    try:
+        legacy_cipher = Fernet(old_key)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid legacy key format: {exc}") from exc
+
+    # Attempt to re-encrypt any stored preference that is still readable with the legacy key.
+    prefs = db.query(UserPreferences).all()
+    migrated = 0
+    for pref in prefs:
+        if not pref.value:
+            continue
+        try:
+            plaintext = crypto_manager.decrypt(pref.value, raise_on_failure=False)
+            if plaintext:
+                # If the current manager can already read it, nothing to do.
+                continue
+        except Exception:
+            pass
+
+        try:
+            legacy_plaintext = legacy_cipher.decrypt(pref.value.encode("utf-8")).decode("utf-8")
+        except (InvalidToken, ValueError, TypeError):
+            continue
+
+        try:
+            pref.value = crypto_manager.encrypt(legacy_plaintext)
+            migrated += 1
+        except Exception as exc:
+            logger.warning("Failed to re-encrypt preference %s during recovery: %s", pref.key, exc)
+
+    db.commit()
+    if migrated:
+        return {"status": "success", "migrated": migrated, "message": "Recovered encrypted preferences using the provided legacy key."}
+    return {"status": "success", "migrated": 0, "message": "No encrypted preferences were recovered with the provided key."}
+
+
 @router.get("/status")
 def get_status(db: Session = Depends(get_db)):
     """Returns boolean status of keys."""
@@ -189,8 +264,8 @@ def get_status(db: Session = Depends(get_db)):
             key_hint = crypto_manager.decrypt(gemini_pref.value).strip()
             if key_hint:
                 provider = detect_provider_from_key(key_hint)
-        except:
-            pass
+        except Exception as e:
+            logger.warning("Failed to decrypt gemini provider preference: %s", e)
     if not provider and env_key:
         provider = detect_provider_from_key(env_key)
     if not provider:
@@ -204,10 +279,10 @@ def get_status(db: Session = Depends(get_db)):
     if tts_provider_pref and tts_provider_pref.value:
         try:
             tts_primary_provider = crypto_manager.decrypt(tts_provider_pref.value).strip()
-        except:
-            pass
+        except Exception as e:
+            logger.warning("Failed to decrypt TTS provider preference: %s", e)
     if not tts_primary_provider:
-        tts_primary_provider = "gemini"
+        tts_primary_provider = "edge"
 
     # Permissions
     return {

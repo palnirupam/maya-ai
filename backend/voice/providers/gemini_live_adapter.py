@@ -60,7 +60,7 @@ def _get_api_key() -> Optional[str]:
                     model_mod.UserPreferences.key == "GEMINI_API_KEY"
                 ).first()
                 if pref and pref.value:
-                    key = crypto_mod.crypto_manager.decrypt(pref.value).strip()
+                    key = crypto_mod.crypto_manager.decrypt(pref.value, raise_on_failure=True).strip()
                     break
             finally:
                 db.close()

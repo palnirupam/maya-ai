@@ -7,8 +7,7 @@ and feeds detected speech into the VoiceStateMachine's audio queue.
 Init sequence (order matters):
   1. Open sounddevice InputStream (float32, 16kHz, mono)
   2. Calibrate ambient noise → set dynamic barge-in threshold
-  3. Load openwakeword model in background thread (non-blocking)
-  4. Start VAD processing loop
+  3. Start VAD processing loop in locked mode
 
 dtype contract:
   All audio data is float32, range [-1.0, 1.0].
@@ -20,7 +19,6 @@ dtype contract:
 import asyncio
 import logging
 import os
-import threading
 import time
 import tempfile
 import wave
@@ -38,6 +36,8 @@ CHUNK_DURATION_MS = 32             # VAD chunk size — Silero VAD v4 requires >
 CHUNK_SAMPLES     = 512            # Exactly 512 — minimum for Silero VAD (sr/chunk must be <= 31.25)
 CALIBRATION_SECS  = 1.0            # Ambient noise measurement window
 BARGE_IN_SENSITIVITY = 3.0        # Configurable — threshold = ambient_rms × this
+MIN_BARGE_IN_THRESHOLD = 0.01     # Never let silent calibration produce threshold=0
+DEFAULT_NATIVE_MIC_LOCKED = True  # Explicit UI/Telegram action is required
 
 # Silence padding around detected speech (prevents clipping)
 PRE_SPEECH_CHUNKS  = 5
@@ -98,8 +98,12 @@ def _release_pid_file():
 
 class DesktopMicrophoneListener:
     """
-    Native desktop microphone listener with VAD, ambient calibration,
-    and optional wake word detection (openwakeword, loaded async).
+    Native desktop microphone listener with VAD and ambient calibration.
+
+    It starts locked by design. The frontend voice button uses its own bounded
+    microphone session; native continuous listening requires an explicit
+    Telegram ``/unlock``. This prevents room audio, speaker echo, or TV speech
+    from becoming unsolicited Maya commands at backend startup.
     """
 
     def __init__(self, state_machine, barge_in: bool = False):
@@ -111,11 +115,9 @@ class DesktopMicrophoneListener:
         # Use the existing Maya SileroVAD wrapper (handles arbitrary chunk sizes)
         from backend.voice.vad.silero import vad as silero_vad
         self._vad = silero_vad
-        self._oww_model = None  # openwakeword — loaded in background thread
-        self._oww_ready = threading.Event()
         self._audio_buffer: list[np.ndarray] = []
         # ── Sleep / Lock mode ────────────────────────────────────────────────────
-        self._is_locked: bool = False
+        self._is_locked: bool = DEFAULT_NATIVE_MIC_LOCKED
         # Separate temporary remote suppression from the user's persistent lock.
         self._remote_suppression_count: int = 0
 
@@ -186,12 +188,10 @@ class DesktopMicrophoneListener:
         # Step 2: Calibrate ambient noise BEFORE starting VAD loop
         self._calibrate_ambient_noise()
 
-        # Step 3: Load openwakeword in background thread (non-blocking)
-        threading.Thread(target=self._load_oww, daemon=True).start()
-
-        # Step 4: Start VAD processing loop
+        # Step 3: Start VAD processing loop. It drains audio without processing
+        # while locked, until the user explicitly sends Telegram /unlock.
         self._running = True
-        logger.info("[DesktopListener] Starting VAD loop.")
+        logger.info("[DesktopListener] Starting VAD loop (microphone locked by default).")
         asyncio.ensure_future(self._vad_loop())
 
     async def stop(self):
@@ -223,7 +223,10 @@ class DesktopMicrophoneListener:
                 chunks.append(data[:, 0] if data.ndim > 1 else data)
             audio = np.concatenate(chunks)
             ambient_rms = float(np.sqrt(np.mean(audio ** 2)))
-            self._barge_in_threshold = ambient_rms * BARGE_IN_SENSITIVITY
+            self._barge_in_threshold = max(
+                ambient_rms * BARGE_IN_SENSITIVITY,
+                MIN_BARGE_IN_THRESHOLD,
+            )
             logger.info(
                 f"[DesktopListener] Calibration complete. "
                 f"Ambient RMS={ambient_rms:.4f} "
@@ -235,38 +238,6 @@ class DesktopMicrophoneListener:
                 f"[DesktopListener] Calibration failed ({e}). "
                 f"Using default threshold {self._barge_in_threshold}."
             )
-
-    # ── Wake Word Loading (async, background) ────────────────────────────────────
-
-    def _load_oww(self):
-        """
-        Load openwakeword in a background thread so startup isn't blocked.
-        Uses 'hey_jarvis' as the wake word until a custom 'hey_maya' model is trained.
-        PTT (Ctrl+Space) is always available as a fallback.
-        """
-        try:
-            from openwakeword.model import Model
-            import os
-            model_dir = os.path.join(
-                os.path.dirname(__file__),
-                "..", "..", ".venv", "Lib", "site-packages",
-                "openwakeword", "resources", "models"
-            )
-            model_path = os.path.normpath(
-                os.path.join(model_dir, "hey_jarvis_v0.1.onnx")
-            )
-            self._oww_model = Model(
-                wakeword_models=[model_path],
-                inference_framework="onnx"
-            )
-            logger.info(
-                "[DesktopListener] openwakeword loaded: 'hey_jarvis' "
-                "(custom 'hey_maya' model pending training)."
-            )
-        except Exception as e:
-            logger.warning(f"[DesktopListener] openwakeword failed to load: {e}. PTT fallback active.")
-        finally:
-            self._oww_ready.set()
 
     # ── VAD Loop ─────────────────────────────────────────────────────────────────
 

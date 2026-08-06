@@ -27,7 +27,7 @@ class ElevenLabsAdapter:
             key_pref = db.query(UserPreferences).filter(UserPreferences.key == "ELEVENLABS_API_KEY").first()
             if key_pref and key_pref.value:
                 try:
-                    self.api_key = crypto_manager.decrypt(key_pref.value).strip()
+                    self.api_key = crypto_manager.decrypt(key_pref.value, raise_on_failure=True).strip()
                 except Exception as e:
                     logger.error(f"Failed to decrypt ELEVENLABS_API_KEY: {e}")
                     self.api_key = None
@@ -38,7 +38,7 @@ class ElevenLabsAdapter:
             voice_pref = db.query(UserPreferences).filter(UserPreferences.key == "ELEVENLABS_VOICE_ID").first()
             if voice_pref and voice_pref.value:
                 try:
-                    self.voice_id = crypto_manager.decrypt(voice_pref.value).strip()
+                    self.voice_id = crypto_manager.decrypt(voice_pref.value, raise_on_failure=True).strip()
                 except Exception as e:
                     logger.error(f"Failed to decrypt ELEVENLABS_VOICE_ID: {e}")
                     self.voice_id = "21m00Tcm4TlvDq8ikWAM" # default Rachel voice
@@ -49,7 +49,7 @@ class ElevenLabsAdapter:
             model_pref = db.query(UserPreferences).filter(UserPreferences.key == "ELEVENLABS_MODEL_ID").first()
             if model_pref and model_pref.value:
                 try:
-                    self.model_id = crypto_manager.decrypt(model_pref.value).strip()
+                    self.model_id = crypto_manager.decrypt(model_pref.value, raise_on_failure=True).strip()
                 except Exception:
                     self.model_id = "eleven_multilingual_v2"
             else:

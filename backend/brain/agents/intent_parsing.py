@@ -41,16 +41,33 @@ _DIRECT_APP_BLOCKERS = re.compile(
 # background audio: the user expects visible YouTube playback. Keep this
 # detector here so it can take the same deterministic path as simple desktop
 # commands.
-_YOUTUBE_SITE_RE = re.compile(r"\b(?:youtube|yt)\b", re.IGNORECASE)
+# 
+# ENHANCED: Supports common typos and variations:
+# - yt, ytt, yttt (extra t's)
+# - youtub, youtube, youtoob, youtbe (typos)
+# - য়ুটিউব, ইউটিউব (Bengali)
+_YOUTUBE_SITE_RE = re.compile(
+    r"\b(?:"
+    r"yt+|"                              # yt, ytt, yttt, etc.
+    r"you[tt]?[ou]?[ob][eb]?|"          # youtube, youtub, youtoob, youtbe, etc.
+    r"য়ুটিউব|ইউটিউব|ইউটুব"            # Bengali variations
+    r")\b",
+    re.IGNORECASE
+)
 _YOUTUBE_PLAY_RE = re.compile(
     r"\b(?:play|chalao|chaliye|chalai|dekhao|dekhte|watch|cinema|movie|film|video)\b",
     re.IGNORECASE,
 )
 _YOUTUBE_QUERY_NOISE = {
-    "youtube", "yt", "open", "launch", "start", "kholo", "khulo",
+    # YouTube variations (including typos)
+    "youtube", "yt", "ytt", "yttt", "youtub", "youtoob", "youtbe", "youttube",
+    # Actions
+    "open", "launch", "start", "kholo", "khulo",
     "khul", "khol", "chalu", "kore", "koro", "kor", "dao", "de",
     "nao", "please", "pls", "play", "chalao", "chaliye", "chalai",
-    "dekhao", "dekhte", "watch", "maya", "te",
+    "dekhao", "dekhte", "watch", "maya", "te", "e", "ei", "ta",
+    # Bengali
+    "য়ুটিউব", "ইউটিউব", "ইউটুব",
 }
 _YOUTUBE_GENERIC_VIDEO_QUERIES = {"cinema", "movie", "film", "video"}
 
@@ -60,19 +77,41 @@ def parse_foreground_youtube_play_intent(text: str) -> str | None:
 
     The presence of YouTube and a playback/video term means the user expects a
     visible browser window, not VLC's headless audio player.
+    
+    HYBRID APPROACH:
+    1. Try regex patterns (fast, instant)
+    2. If regex fails but looks like YouTube intent, use AI to understand (smart)
+    
+    IMPORTANT: If "video" or "cinema" or "watch" is mentioned, this is ALWAYS
+    foreground playback, even if the search query itself doesn't contain those words.
     """
     raw = (text or "").strip()
+    
+    # Quick rejection: explicit background request
     if re.search(r"\bbackground\b", raw, re.IGNORECASE):
         return None
-    if not (
-        _YOUTUBE_SITE_RE.search(raw)
-        and _YOUTUBE_PLAY_RE.search(raw)
-    ):
-        return None
-
-    words = re.findall(r"[A-Za-z0-9]+", raw)
-    query = " ".join(word for word in words if word.lower() not in _YOUTUBE_QUERY_NOISE)
-    return query or None
+    
+    # Step 1: Try regex (fast path)
+    has_youtube_mention = _YOUTUBE_SITE_RE.search(raw)
+    has_play_intent = _YOUTUBE_PLAY_RE.search(raw)
+    
+    if has_youtube_mention and has_play_intent:
+        # Extract query - remove YouTube-related noise words
+        words = re.findall(r"[A-Za-z0-9]+", raw)
+        query = " ".join(word for word in words if word.lower() not in _YOUTUBE_QUERY_NOISE)
+        return query or None
+    
+    # Step 2: AI fallback for unclear cases (e.g., "yootuube e gaana bajao")
+    # Only try AI if it looks like it might be a YouTube request
+    if len(raw) < 100:  # Short commands only
+        # Check for play-like words even if YouTube mention wasn't detected by regex
+        play_words = ["chalao", "play", "bajao", "dekhao", "video", "song", "gaan", "cinema", "movie"]
+        if any(word in raw.lower() for word in play_words):
+            ai_result = _ai_understand_youtube_intent(raw)
+            if ai_result:
+                return ai_result
+    
+    return None
 
 
 def is_generic_youtube_video_query(query: str | None) -> bool:
@@ -81,11 +120,80 @@ def is_generic_youtube_video_query(query: str | None) -> bool:
     return bool(words) and all(word.lower() in _YOUTUBE_GENERIC_VIDEO_QUERIES for word in words)
 
 
+def _ai_understand_youtube_intent(text: str) -> str | None:
+    """Use AI to understand YouTube intent from unclear/typo text.
+    
+    Examples:
+    - "yootuube e gaana bajao" → "gaana"
+    - "yttt cinema dekhao" → "cinema"  
+    - "youtoob e mone valo korar song chalao" → "mone valo korar song"
+    
+    Returns the search query if YouTube intent detected, None otherwise.
+    """
+    from functools import lru_cache
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    
+    @lru_cache(maxsize=100)
+    def _cached_ai_youtube(t: str) -> str | None:
+        try:
+            from dotenv import load_dotenv
+            import google.generativeai as genai
+            import os
+            
+            # Load .env if not already loaded
+            load_dotenv()
+            
+            api_key = os.getenv("GEMINI_API_KEY")
+            if not api_key:
+                logger.debug("AI YouTube understanding skipped: No GEMINI_API_KEY")
+                return None
+            
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemini-2.0-flash-exp")
+            
+            prompt = f"""Is this a YouTube play request? If yes, return ONLY the search query. If no, return "NO".
+
+Examples:
+"yootuube e gaana bajao" → "gaana"
+"yttt cinema dekhao" → "cinema"
+"whatsapp kholo" → "NO"
+"volume barao" → "NO"
+
+User said: "{t}"
+Answer:"""
+            
+            response = model.generate_content(
+                prompt,
+                generation_config=genai.GenerationConfig(
+                    max_output_tokens=30,
+                    temperature=0.1,
+                )
+            )
+            
+            result = response.text.strip()
+            
+            if result.upper() == "NO" or not result:
+                return None
+            
+            logger.info(f"[AI YouTube Understanding] '{t}' → '{result}'")
+            return result
+            
+        except Exception as e:
+            logger.debug(f"AI YouTube understanding failed: {e}")
+        
+        return None
+    
+    return _cached_ai_youtube(text.strip())
+
+
 # ── YouTube playback mode (visible screen vs background audio) ───────────────
-# "yt e video dekhbo" → the user will WATCH: visible browser playback.
-# "background e chalao" / "shunbo" → audio only: VLC background player.
-# Neither word present ("yt e arijit er gaan chalao") → ambiguous: Maya must
-# ASK before playing so audio never pops a browser window (and vice versa).
+# DEFAULT: "yt te play koro" / "YouTube te gaan chalao" → FOREGROUND (visible browser)
+# OVERRIDE: "background e chalao" / "audio shunbo" → BACKGROUND (VLC audio only)
+# 
+# User expectation: YouTube requests should open videos in browser UNLESS explicitly
+# asking for background/audio-only playback.
 _YOUTUBE_WATCH_MODE_RE = re.compile(
     r"\b(?:dekh\w*|watch\w*|video|cinema|movie|film|screen|samne|foreground)\b"
     r"|দেখ|ভিডিও|সিনেমা|স্ক্রিন|देख|स्क्रीन",
@@ -100,12 +208,33 @@ _YOUTUBE_LISTEN_MODE_RE = re.compile(
 
 
 def parse_youtube_mode_answer(text: str) -> str | None:
-    """'foreground' | 'background' if the text states HOW to play, else None."""
+    """'foreground' | 'background' if the text states HOW to play, else None.
+    
+    DEFAULT: YouTube + play = foreground (visible browser playback).
+    OVERRIDE: Explicit "background"/"audio"/"shunbo" = background (VLC audio only).
+    
+    This matches user expectations: "YouTube te play koro" = open video in browser,
+    unless user explicitly asks for background audio.
+    """
     raw = text or ""
+    
+    # Explicit background request (highest priority)
     if _YOUTUBE_LISTEN_MODE_RE.search(raw):
         return "background"
+    
+    # Explicit foreground keywords (cinema, video, watch, etc.)
     if _YOUTUBE_WATCH_MODE_RE.search(raw):
         return "foreground"
+    
+    # DEFAULT: If YouTube + play detected, assume foreground
+    # This function is called after parse_foreground_youtube_play_intent() succeeded,
+    # meaning YouTube site + play intent were already detected.
+    # So if we reach here with no explicit background/foreground keywords,
+    # default to foreground (visible playback) as that's the common expectation.
+    if _YOUTUBE_SITE_RE.search(raw) and _YOUTUBE_PLAY_RE.search(raw):
+        return "foreground"
+    
+    # No YouTube context detected
     return None
 
 

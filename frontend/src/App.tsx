@@ -11,6 +11,8 @@ import { useVoiceSession } from './hooks/useVoiceSession';
 import { MicOff, Settings, Radio } from 'lucide-react';
 import { useCanvasStore } from './store/canvasStore';
 import { CanvasPanel } from './components/CanvasPanel';
+import { RecoveryModal } from './components/ui/RecoveryModal';
+import { createCanvasPollTracker } from './services/canvasPolling';
 
 // Status labels for each session state
 const SESSION_LABELS: Record<string, string> = {
@@ -31,6 +33,16 @@ function App() {
 
   // Also keep text input available as fallback
   const [textValue, setTextValue] = useState('');
+  const [recoveryRequired, setRecoveryRequired] = useState(false);
+
+  useEffect(() => {
+    fetch(`${backendHttpUrl}/settings/status/app`)
+      .then(res => res.json())
+      .then(data => {
+        if (data.recovery_required) setRecoveryRequired(true);
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     wsClient.connect();
@@ -38,18 +50,19 @@ function App() {
   }, []);
 
   // ── Canvas polling fallback ──────────────────────────────────────────────────
-  // Polls /canvas/latest every 2s. If a newer canvas was written (mtime changed),
-  // opens the panel automatically — even if the WebSocket broadcast was missed.
+  // Polls /canvas/latest every 2s. Start from the app-mount timestamp so an old
+  // canvas left on disk is only a baseline, never a new update that auto-opens.
+  // Canvases written after this app instance mounted still open if WebSocket was
+  // briefly unavailable.
   useEffect(() => {
-    let lastMtime = 0;
+    const canvasPollTracker = createCanvasPollTracker();
     const poll = async () => {
       try {
         const r = await fetch(`${backendHttpUrl}/canvas/latest`);
         if (!r.ok) return;
-        const { session_id, updated_at } = await r.json();
-        if (session_id && updated_at > lastMtime) {
-          lastMtime = updated_at;
-          useCanvasStore.getState().triggerUpdate(session_id);
+        const sessionId = canvasPollTracker.accept(await r.json());
+        if (sessionId) {
+          useCanvasStore.getState().triggerUpdate(sessionId);
         }
       } catch { /* backend not ready yet */ }
     };
@@ -80,6 +93,9 @@ function App() {
 
         {/* Settings Modal */}
         <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />
+
+        {/* Recovery Modal */}
+        <RecoveryModal isOpen={recoveryRequired} onSuccess={() => window.location.reload()} />
 
         {/* Background Decor */}
         <div className="absolute top-0 left-0 w-full h-full overflow-hidden z-0 pointer-events-none">

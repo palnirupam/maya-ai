@@ -132,7 +132,8 @@ _FILE_ON_DISK_PATTERNS = re.compile(
 
 _GREETING_PATTERNS = re.compile(
     r"^(hi|hii|hello|hey|yo|maya|hi maya|hello maya|hey maya|namaste|nomoskar|salaam"
-    r"|good morning|good afternoon|good evening|good night|kemon acho|ki khobor|kaise ho)$",
+    r"|good morning|good afternoon|good evening|good night|kemon acho|ki khobor|kaise ho"
+    r"|how are you|how r u|how's it going|kemon ache|ki khobor ami|howdy)$",
     re.IGNORECASE
 )
 
@@ -261,10 +262,12 @@ def _parse_bulk_app_close(text: str) -> str | None:
     return excluded.strip(" ,.-")
 
 
-def _parse_direct_app_action(text: str, fallback_app_name: str | None = None) -> tuple[str, str] | None:
+def _parse_direct_app_action(text: str, fallback_app_name: str | None = None, context_history: list = None) -> tuple[str, str] | None:
     """
     Deterministic fast path for simple app control.
     This avoids spending an LLM call just to decide open_app("notepad").
+    
+    ENHANCED: Context-aware close detection - uses recently opened apps from conversation history.
     """
     if _DIRECT_APP_BLOCKERS.search(text):
         return None
@@ -289,6 +292,29 @@ def _parse_direct_app_action(text: str, fallback_app_name: str | None = None) ->
         return None
 
     app_name = _normalize_app_query(text)
+    
+    # ENHANCED: Context-aware close detection
+    # If no app name detected but close intent exists, check recent conversation for opened apps
+    if not app_name and _DIRECT_APP_CLOSE_PATTERNS.search(text) and context_history:
+        # Look for recently opened apps in the last 5 turns
+        for msg in reversed(context_history[-10:]):  # Check last 10 messages (5 turns)
+            if isinstance(msg, dict):
+                content = msg.get("content", "")
+                # Pattern: "Opened X" or "X open kore dilam" or "Launched X"
+                opened_match = re.search(
+                    r"(?:Opened|Launched|খুলে দিলাম|open kore dilam|khol diya|khul gaya)\s+([A-Za-z0-9\s]+?)(?:\.|$|via|through)",
+                    content,
+                    re.IGNORECASE
+                )
+                if opened_match:
+                    recent_app = opened_match.group(1).strip().lower()
+                    # Clean common suffixes
+                    recent_app = re.sub(r"\s+(via|through|protocol|app)$", "", recent_app, flags=re.IGNORECASE)
+                    if recent_app:
+                        import logging
+                        logging.info(f"[Context-aware close] Using recently opened app: {recent_app}")
+                        return "close_app", recent_app
+    
     if not app_name and fallback_app_name:
         if _DIRECT_APP_CLOSE_PATTERNS.search(text):
             return "close_app", fallback_app_name

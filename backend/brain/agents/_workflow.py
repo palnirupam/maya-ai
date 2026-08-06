@@ -2,10 +2,12 @@ import logging
 import json
 import asyncio
 import re
-from typing import AsyncGenerator, Union
+import time
+from typing import AsyncGenerator, Union, Optional
 
 logger = logging.getLogger(__name__)
 from ..providers.gemini_adapter import gemini_adapter
+from ..progress_tracker import ProgressTracker, ProgressStage
 from .agent_defs import AGENTS, ROUTING_PROMPT
 from ..gemini.function_calls import get_maya_tools
 from .tool_router import select_relevant_tools, ROUTER_SIZE_GATE, _SEND_INTENT_RE
@@ -59,7 +61,9 @@ async def execute_workflow(
     session_id: str,
     text: str,
     context_history: list[dict],
-    image_base64: str = None
+    image_base64: str = None,
+    progress_tracker: Optional[ProgressTracker] = None,
+    tool_event_callback=None
 ) -> AsyncGenerator[Union[str, dict], None]:
     """
     Stateful execution coordinator for the Multi-Agent team.
@@ -67,6 +71,15 @@ async def execute_workflow(
     and passes inter-agent results downstream.
     """
     logger.info(f"Multi-agent workflow routing request: {text}")
+    
+    # Initialize progress tracking
+    if progress_tracker:
+        await progress_tracker.start_step(
+            "Analyzing request...",
+            agent="Router",
+            stage=ProgressStage.ROUTING
+        )
+    
     conversation_style = detect_conversation_style(text, context_history)
     if text.startswith("SYSTEM_EVENT_STARTUP_GREETING"):
         conversation_style = BANGLISH
@@ -111,10 +124,17 @@ async def execute_workflow(
             quick_response = {'hi': 'Hello!', 'hello': 'Haan bolo!', 'hey': 'Haan!', 'ok': 'Theek hai.', 'okay': 'Hoga.', 'thanks': 'Koi baat nahi!', 'thank you': 'Shukriya!', 'bye': 'Alvida!'}[text_lower] if text_lower in {'hi', 'hello', 'hey', 'ok', 'okay', 'thanks', 'thank you', 'bye'} else quick_response
         
         context_history.append({"role": "assistant", "content": quick_response})
+        
+        if progress_tracker:
+            await progress_tracker.finalize("Greeting completed")
+        
         yield quick_response
         return
 
     # ── Phase A: Intent Sentinel (Security Layer) ────────────────────────────
+    if progress_tracker:
+        await progress_tracker.update_progress("Security check...")
+    
     from .intent_sentinel import IntentSentinel
     from ...system.state_manager import state_manager
     ctx_prompt_info = state_manager.get_prompt_context()
@@ -124,6 +144,8 @@ async def execute_workflow(
     intent_decision = IntentSentinel.evaluate(text, active_mode, capabilities)
     if intent_decision.status == "block":
         await _log_fast_path(session_id, text, "sentinel_block", error=intent_decision.reason)
+        if progress_tracker:
+            await progress_tracker.fail(intent_decision.reason)
         yield intent_decision.suggested_action or intent_decision.reason
         return
     # NOTE: IntentSentinel never returns "needs_approval" — it has no way to
@@ -133,6 +155,9 @@ async def execute_workflow(
     # round-trips through a tool_call_request approve/deny event.
 
     # ── Phase B: Analysis Pass + BudgetManager ────────────────────────────────
+    if progress_tracker:
+        await progress_tracker.update_progress("Understanding intent...", metadata={"stage": "analysis"})
+    
     from ..reasoning.analysis_pass import run_heuristic_pass, build_task_graph_if_needed
     from ..budget_manager import budget_manager
 
@@ -178,6 +203,13 @@ async def execute_workflow(
         }
 
     # ── 1. Routing phase ─────────────────────────────────────────────────────
+    if progress_tracker:
+        await progress_tracker.start_step(
+            "Routing to appropriate agent...",
+            agent="Router",
+            stage=ProgressStage.ROUTING
+        )
+    
     # Try fast keyword router first (saves ~1-2s Gemini call). Pass the last
     # agent so short follow-ups can stick to it instead of collapsing to CHAT,
     # and the one-shot pending-send flag so a mid-send clarification reply
@@ -212,7 +244,7 @@ async def execute_workflow(
                     conversation_style = _prev_style
     last_direct_app = _last_app_from_history(context_history, session_id)
     direct_app_candidate = (
-        _parse_direct_app_action(text, last_direct_app)
+        _parse_direct_app_action(text, last_direct_app, context_history=context_history)
         if not image_base64
         else None
     )
@@ -278,6 +310,9 @@ async def execute_workflow(
     else:
         # Fall back to Gemini router for ambiguous messages. Prepend a hint of the
         # recent turn so follow-ups ("50% koro" after "volume 20% koro") resolve.
+        if progress_tracker:
+            await progress_tracker.update_progress("Analyzing with AI router...")
+        
         ctx_prefix = _router_context_prefix(context_history, text)
         routing_context = [
             {"role": "system", "content": ROUTING_PROMPT},
@@ -350,6 +385,13 @@ async def execute_workflow(
     # Only call LLM for complex/ambiguous queries.
     # This keeps common actions instant while providing AI power when needed.
     
+    if progress_tracker:
+        await progress_tracker.start_step(
+            "Classifying intent...",
+            agent="Classifier",
+            stage=ProgressStage.CLASSIFYING
+        )
+    
     from .universal_intent_classifier import classify_universal_intent
     
     # Quick pre-check: Does this need AI classification?
@@ -395,6 +437,21 @@ async def execute_workflow(
             camera_look_intent = universal_intent.camera_outfit
             camera_review_intent = universal_intent.camera_review
             is_wallpaper_request = universal_intent.wallpaper_change
+            
+            # CRITICAL FIX: Use intent classifier's agent suggestion for conversational queries
+            # This ensures "How are you", "Tomer somporke kichu bolo" goes to CHAT, not OS_EXECUTOR
+            if universal_intent and universal_intent.primary_agent:
+                suggested_agent = universal_intent.primary_agent.upper()
+                # Override if classifier suggests CHAT (conversational) UNLESS there's a strong OS signal
+                # Strong OS signals: direct app action, OS control, YouTube query
+                has_strong_os_signal = any([
+                    direct_app_candidate, direct_os_candidate, 
+                    foreground_youtube_query, background_youtube_query,
+                    youtube_mode_needed_query
+                ])
+                if suggested_agent == "CHAT" and not has_strong_os_signal:
+                    cleaned_agents = [suggested_agent]
+                    logger.info(f"[Intent Override] Using classifier suggestion: {suggested_agent} (overriding fast-route)")
         except Exception as e:
             logger.warning(f"Intent classification failed: {e}. Using regex fallback.")
             # Fallback to regex if LLM fails
@@ -413,6 +470,14 @@ async def execute_workflow(
     
     # Handle camera review if appropriate
     if (camera_look_intent or camera_review_intent) and cleaned_agents == ["OS_EXECUTOR"] and not image_base64 and not camera_recently_attempted:
+        # Progress: Camera execution
+        if progress_tracker:
+            await progress_tracker.start_step(
+                "Capturing camera feed...",
+                agent="OS_EXECUTOR",
+                stage=ProgressStage.EXECUTING
+            )
+        
         # Delegate to camera handler
         async for result in handle_camera_review(
             text=text,
@@ -430,6 +495,10 @@ async def execute_workflow(
             AGENTS=AGENTS,
         ):
             yield result
+        
+        # Finalize progress after camera execution
+        if progress_tracker:
+            await progress_tracker.finalize("Camera review completed")
         return
     if youtube_mode_needed_query and cleaned_agents == ["OS_EXECUTOR"]:
         # WHAT to play is known, HOW is not — confirm before touching anything.
@@ -443,6 +512,10 @@ async def execute_workflow(
             text,
             "youtube_mode_request",
         )
+        
+        if progress_tracker:
+            await progress_tracker.finalize("Awaiting YouTube mode confirmation")
+        
         yield final_text
         return
     if direct_youtube_bg_query:
@@ -450,6 +523,14 @@ async def execute_workflow(
             "Direct background YouTube playback matched: %r",
             direct_youtube_bg_query,
         )
+        
+        if progress_tracker:
+            await progress_tracker.start_step(
+                "Playing YouTube in background...",
+                agent="OS_EXECUTOR",
+                stage=ProgressStage.EXECUTING
+            )
+        
         yield {
             "type": "agent_status",
             "data": {
@@ -497,6 +578,10 @@ async def execute_workflow(
             tool_name="play_youtube_background",
             error=None if str(safe_result).startswith("SUCCESS") else str(safe_result).split(":", 1)[0],
         )
+        
+        if progress_tracker:
+            await progress_tracker.finalize("YouTube playback started")
+        
         yield final_text
         return
     if youtube_title_needed:
@@ -508,6 +593,10 @@ async def execute_workflow(
             text,
             "youtube_title_request",
         )
+        
+        if progress_tracker:
+            await progress_tracker.finalize("Awaiting YouTube title")
+        
         yield final_text
         return
     if direct_youtube_query:
@@ -515,6 +604,14 @@ async def execute_workflow(
             "Direct foreground YouTube playback matched: %r",
             direct_youtube_query,
         )
+        
+        if progress_tracker:
+            await progress_tracker.start_step(
+                "Opening YouTube...",
+                agent="OS_EXECUTOR",
+                stage=ProgressStage.EXECUTING
+            )
+        
         yield {
             "type": "agent_status",
             "data": {
@@ -567,11 +664,22 @@ async def execute_workflow(
             tool_name="search_youtube",
             error=None if str(safe_result).startswith("SUCCESS") else str(safe_result).split(":", 1)[0],
         )
+        
+        if progress_tracker:
+            await progress_tracker.finalize("YouTube opened")
+        
         yield final_text
         return
     if direct_app_action:
         func_name, app_name = direct_app_action
         logger.info(f"Direct app action matched: {func_name}({app_name!r})")
+        
+        if progress_tracker:
+            await progress_tracker.start_step(
+                f"Executing app action: {func_name}...",
+                agent="OS_EXECUTOR",
+                stage=ProgressStage.EXECUTING
+            )
 
         yield {
             "type": "agent_status",
@@ -639,6 +747,10 @@ async def execute_workflow(
                     tool_name=func_name,
                     error="APPROVAL_DENIED",
                 )
+                
+                if progress_tracker:
+                    await progress_tracker.fail("Permission denied by user")
+                
                 yield denial_text
                 return
 
@@ -738,6 +850,13 @@ async def execute_workflow(
             error=error_status,
             latency_ms=elapsed_ms,
         )
+        
+        if progress_tracker:
+            if error_status:
+                await progress_tracker.fail(f"App action failed: {error_status}")
+            else:
+                await progress_tracker.finalize("App action completed")
+        
         yield final_text
         return
 
@@ -767,6 +886,13 @@ async def execute_workflow(
     if direct_os_action:
         func_name, kwargs, control_type, display_msg = direct_os_action
         logger.info(f"Direct OS action matched: {func_name}({kwargs})")
+        
+        if progress_tracker:
+            await progress_tracker.start_step(
+                f"Executing system control: {func_name}...",
+                agent="OS_EXECUTOR",
+                stage=ProgressStage.EXECUTING
+            )
 
         yield {
             "type": "agent_status",
@@ -799,6 +925,10 @@ async def execute_workflow(
                 context_history.append({"role": "function", "name": func_name, "content": denial})
                 final_text = _style_msg(_SYSTEM_COPY["power_denied"], conversation_style)
                 context_history.append({"role": "assistant", "content": final_text})
+                
+                if progress_tracker:
+                    await progress_tracker.fail("Permission denied by user")
+                
                 yield final_text
                 return
 
@@ -835,6 +965,10 @@ async def execute_workflow(
             )
             context_history.append({"role": "assistant", "content": final_text})
             await _log_fast_path(session_id, text, "direct_os", tool_name=func_name)
+            
+            if progress_tracker:
+                await progress_tracker.finalize("System control completed")
+            
             yield final_text
             return
 
@@ -875,6 +1009,14 @@ async def execute_workflow(
         is_last_agent = (agent_idx == len(cleaned_agents) - 1)
         agent_config = AGENTS[agent_name]
         logger.info(f"Activating agent: {agent_config.name}")
+        
+        # Progress: Starting agent execution
+        if progress_tracker:
+            await progress_tracker.start_step(
+                f"Executing: {agent_config.role}...",
+                agent=agent_name,
+                stage=ProgressStage.EXECUTING
+            )
 
         # Get tone/mode from StateManager
         from ...system.state_manager import state_manager
@@ -1064,6 +1206,21 @@ async def execute_workflow(
                 if isinstance(chunk, dict):
                     if chunk.get("type") == "tool_call":
                         tool_calls_this_round.append(chunk)
+                        
+                        # Emit tool execution starting event — handle sync and async callbacks
+                        if tool_event_callback:
+                            _cb_res = tool_event_callback({
+                                "type": "tool_execution",
+                                "data": {
+                                    "tool_name": chunk.get("name", "unknown"),
+                                    "status": "starting",
+                                    "args": chunk.get("args", {}),
+                                    "timestamp": time.time()
+                                }
+                            })
+                            if asyncio.iscoroutine(_cb_res):
+                                await _cb_res
+
                     # Always pass through status/reasoning events
                     else:
                         yield chunk
@@ -1201,6 +1358,14 @@ async def execute_workflow(
             for tc in tool_calls_this_round:
                 func_name = tc["name"]
                 args = tc.get("args", {})
+                
+                # Progress: Before tool execution
+                if progress_tracker:
+                    await progress_tracker.update_progress(
+                        f"Running tool: {func_name}...",
+                        metadata={"tool": func_name, "args": args}
+                    )
+                
                 delivery_key = _delivery_fingerprint(func_name, args) if func_name in _SEND_EXECUTING_TOOLS else None
                 duplicate_delivery = bool(
                     delivery_key and delivery_key in executed_delivery_fingerprints
@@ -1276,7 +1441,13 @@ async def execute_workflow(
                     verify_result = VerifyResult(valid=True)
 
                     for attempt in range(max_attempts):
-                        raw_result = await _run_tool(current_tool_name, current_args, all_tools, conversation_style)
+                        raw_result = await _run_tool(
+                            current_tool_name, 
+                            current_args, 
+                            all_tools, 
+                            conversation_style,
+                            tool_event_callback=tool_event_callback
+                        )
                         verify_result = await ResultVerifier.verify(current_tool_name, raw_result, manifest)
 
                         if verify_result.valid:
@@ -1406,6 +1577,10 @@ async def execute_workflow(
                     # keywords — remember the paused flow so it sticks to
                     # OS_EXECUTOR instead of collapsing to CHAT.
                     _remember_pending_send(session_id)
+                    
+                    if progress_tracker:
+                        await progress_tracker.finalize("Awaiting user clarification")
+                    
                     yield f"\n{clarify_text}"
                     previous_agent_results.append(clarify_text)
                     combined = "\n\n".join(r for r in previous_agent_results if r)
@@ -1453,6 +1628,13 @@ async def execute_workflow(
                     delivery_reply = str(safe_result)
                     if not tool_result_verified:
                         _remember_pending_send(session_id)
+                    
+                    if progress_tracker:
+                        if tool_result_verified:
+                            await progress_tracker.finalize("Message delivered")
+                        else:
+                            await progress_tracker.fail("Message delivery failed")
+                    
                     yield f"\n{delivery_reply}"
                     previous_agent_results.append(delivery_reply)
                     context_history.append({"role": "assistant", "content": delivery_reply})
@@ -1491,3 +1673,8 @@ async def execute_workflow(
     if previous_agent_results:
         combined = "\n\n".join(r for r in previous_agent_results if r)
         context_history.append({"role": "assistant", "content": combined})
+    
+    # Finalize progress tracking
+    if progress_tracker:
+        await progress_tracker.finalize("Task completed")
+

@@ -3,12 +3,21 @@ import errno
 import os
 import shutil
 import uuid
+import webbrowser
+from pathlib import Path
 from ..core.policy import is_safe_path
 from ..core.path import dedupe_path, ensure_parent, find_items
 
 _PDF_EXTS = {".pdf"}
 _DOCX_EXTS = {".docx"}
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff"}
+_BROWSER_EXTS = {
+    ".html", ".htm", ".xhtml", ".mhtml", ".mht", ".pdf", ".txt", ".text",
+    ".md", ".css", ".js", ".json", ".xml", ".csv", ".log",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico",
+    ".avif", ".tif", ".tiff", ".mp3", ".wav", ".ogg", ".m4a", ".aac",
+    ".flac", ".mp4", ".webm", ".mov", ".ogv",
+}
 
 
 class PartialFileOperationError(RuntimeError):
@@ -167,6 +176,46 @@ def _read_image(src):
         return f"ERR: OCR failed ({e})"
 
 
+def _resolve_browser_file(src: str, name: str, max_results: int) -> tuple[str | None, str | None]:
+    """Resolve an existing path, or locate a filename across Maya's search roots."""
+    requested = str(src or "").strip()
+    if requested and os.path.isfile(requested):
+        return os.path.abspath(requested), None
+    if requested and (os.path.isabs(requested) or os.path.dirname(requested)):
+        return None, f"ERR: not a file {requested}"
+
+    query = str(name or requested).strip()
+    if not query:
+        return None, "ERR: file name cannot be empty"
+    matches = [candidate for candidate in find_items(query, max_results) if os.path.isfile(candidate)]
+    if not matches:
+        return None, f"Not found: '{query}'"
+
+    query_name = os.path.basename(query).casefold()
+    exact = [candidate for candidate in matches if os.path.basename(candidate).casefold() == query_name]
+    return os.path.abspath((exact or matches)[0]), None
+
+
+def _open_in_browser(src: str, name: str, max_results: int) -> str:
+    target, error = _resolve_browser_file(src, name, max_results)
+    if error:
+        return error
+    if not target or not is_safe_path(target):
+        return "ERR: protected path"
+
+    extension = os.path.splitext(target)[1].lower()
+    if extension not in _BROWSER_EXTS:
+        return f"ERR: {extension or 'extensionless file'} is not supported for browser opening"
+
+    try:
+        url = Path(target).resolve().as_uri()
+        if not webbrowser.open(url, new=2):
+            return f"ERR: default browser did not accept {target}"
+        return f"OK: opened {target} in the default browser"
+    except Exception as exc:
+        return f"ERR: failed to open {target} in browser ({exc})"
+
+
 def _move(src, dst):
     dest = _destination(src, dst)
     if os.path.isdir(src) and _is_within(dest, src):
@@ -288,6 +337,12 @@ def handle_file(action, src="", dst="", name="", n=5, path=""):
                 return _read_image(src)
             with open(src, encoding="utf-8") as f:
                 return f.read()
+        except Exception as e:
+            return f"ERR: {e}"
+
+    if action == "open":
+        try:
+            return _open_in_browser(src, name, n)
         except Exception as e:
             return f"ERR: {e}"
 

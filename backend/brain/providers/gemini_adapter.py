@@ -33,6 +33,17 @@ from ...config.provider_config import (
 logger = logging.getLogger(__name__)
 
 
+def _get_fallback_error_message() -> str:
+    from ..language_style import BANGLISH, HINDILISH, get_latest_conversation_style
+    style = get_latest_conversation_style()
+    if style == BANGLISH:
+        return "Dukhito, amar ektu shomoshya hocche."
+    if style == HINDILISH:
+        return "Maaf kijiye, mujhe thodi pareshaan hoti hai."
+    return "I'm sorry, I encountered an error while processing that."
+
+
+
 class ThinkStripper:
     """Streaming-safe filter that removes model chain-of-thought that some
     OpenAI-compatible providers embed inside the `content` field instead of a
@@ -313,11 +324,11 @@ _ACTION_ENUMS = {
     "wifi_toggle": ["on", "off"],
     "bluetooth_toggle": ["on", "off"],
     "file": [
-        "copy", "move", "rename", "delete", "mkdir", "read", "write",
+        "copy", "move", "rename", "delete", "mkdir", "read", "open", "write",
         "ls", "search", "delete_by_name", "organize",
     ],
     "pc": [
-        "volume", "brightness", "lock", "mute", "screenshot", "sleep",
+        "volume", "brightness", "lock", "mute", "screenshot", "camera_photo", "sleep",
         "shutdown", "restart", "hibernate",
         "clipboard_read", "clipboard_write",
         "process_list", "process_kill",
@@ -547,7 +558,7 @@ class GeminiAdapter(LLMProvider):
                 api_key = env_api_key
                 logger.info("Loaded AI API Key from environment provider override.")
             elif pref and pref.value:
-                api_key = (crypto_manager.decrypt(pref.value) or "").strip()
+                api_key = (crypto_manager.decrypt(pref.value, raise_on_failure=True) or "").strip()
                 if api_key:
                     logger.info("Loaded Gemini API Key from encrypted database.")
                 else:
@@ -564,31 +575,26 @@ class GeminiAdapter(LLMProvider):
                 self.client = None
                 return
             
-            # Load stored provider if any
-            provider_pref = db.query(UserPreferences).filter(UserPreferences.key == "GEMINI_API_PROVIDER").first()
             stored_provider = None
-            if provider_pref and provider_pref.value:
-                try:
-                    stored_provider = normalize_provider(crypto_manager.decrypt(provider_pref.value))
-                except:
-                    pass
-
-            base_url_pref = db.query(UserPreferences).filter(UserPreferences.key == "GEMINI_API_BASE_URL").first()
             stored_base_url = None
-            if base_url_pref and base_url_pref.value:
-                try:
-                    stored_base_url = (crypto_manager.decrypt(base_url_pref.value) or "").strip()
-                except:
-                    pass
-            
-            # Load stored active model if any
-            model_pref = db.query(UserPreferences).filter(UserPreferences.key == "GEMINI_ACTIVE_MODEL").first()
             stored_model = None
-            if model_pref and model_pref.value:
-                try:
-                    stored_model = crypto_manager.decrypt(model_pref.value)
-                except:
-                    pass
+
+            if api_key:
+                prefs = db.query(UserPreferences).all()
+                provider_pref = next((p for p in prefs if p.key == "GEMINI_API_PROVIDER"), None)
+                if provider_pref and provider_pref.value:
+                    # Non-critical: Provider name. If unreadable, fallback to default provider.
+                    stored_provider = normalize_provider(crypto_manager.decrypt(provider_pref.value, raise_on_failure=False))
+                
+                base_url_pref = next((p for p in prefs if p.key == "GEMINI_API_BASE_URL"), None)
+                if base_url_pref and base_url_pref.value:
+                    # Non-critical: Base URL. If unreadable, fallback to empty/default.
+                    stored_base_url = (crypto_manager.decrypt(base_url_pref.value, raise_on_failure=False) or "").strip()
+                
+                model_pref = next((p for p in prefs if p.key == "GEMINI_ACTIVE_MODEL"), None)
+                if model_pref and model_pref.value:
+                    # Non-critical: Model name. If unreadable, fallback to default model.
+                    stored_model = crypto_manager.decrypt(model_pref.value, raise_on_failure=False)
 
             self.api_key = api_key
             self.client = None
@@ -762,7 +768,8 @@ class GeminiAdapter(LLMProvider):
                         fc = message["tool_calls"][0]["function"]
                         try:
                             args = json.loads(fc["arguments"]) if fc.get("arguments") else {}
-                        except:
+                        except json.JSONDecodeError as e:
+                            logger.warning("Failed to parse tool call arguments: %s", e)
                             args = {}
                         return f"TOOL_CALL:{fc['name']}:{args}"
                         
@@ -781,7 +788,7 @@ class GeminiAdapter(LLMProvider):
             logger.error(f"Custom LLM API Error after trying all models: {last_error}")
         from ...system.state_manager import state_manager
         if state_manager.state.active_mode in ("friendly", "companion"):
-            return "দুঃখিত, আমার একটু সমস্যা হচ্ছে।"
+            return _get_fallback_error_message()
         return "I'm sorry, I encountered an error while processing that."
 
     async def generate_custom_stream(self, context: list[dict], tools: list) -> AsyncGenerator[str, None]:
@@ -888,7 +895,8 @@ class GeminiAdapter(LLMProvider):
                     if tc["name"]:
                         try:
                             args = json.loads(tc["arguments"]) if tc["arguments"] else {}
-                        except:
+                        except json.JSONDecodeError as e:
+                            logger.warning("Failed to parse tool call arguments in stream: %s", e)
                             args = {}
                         yield {
                             "type": "tool_call",
@@ -916,7 +924,7 @@ class GeminiAdapter(LLMProvider):
                 logger.error(f"Custom LLM Stream Error: {last_error}")
                 from ...system.state_manager import state_manager
                 if state_manager.state.active_mode in ("friendly", "companion"):
-                    yield " দুঃখিত, আমার একটু সমস্যা হচ্ছে।"
+                    yield f" {_get_fallback_error_message()}"
                 else:
                     yield " I'm sorry, I encountered an error while thinking."
         
@@ -1082,6 +1090,13 @@ class GeminiAdapter(LLMProvider):
                 else:
                     contents.append(types.Content(role=target_role, parts=[part]))
             
+            if prompt:
+                part = types.Part.from_text(text=prompt)
+                if contents and contents[-1].role == "user":
+                    contents[-1].parts.append(part)
+                else:
+                    contents.append(types.Content(role="user", parts=[part]))
+
             # If vision context is provided, attach it to the final user message
             if image_base64 and len(contents) > 0 and contents[-1].role == "user":
                 import base64
@@ -1107,12 +1122,11 @@ class GeminiAdapter(LLMProvider):
                 )
             )
             fallbacks = [
-                'gemini-3.5-flash',
-                'gemini-3.1-flash-lite',
-                'gemini-2.5-flash-lite',
                 'gemini-2.5-flash',
+                'gemini-2.5-flash-lite',
                 'gemini-2.0-flash',
                 'gemini-1.5-flash',
+                'gemini-1.5-flash-8b',
             ]
             models_to_try = [self._resolve_primary_model(model_tier)]
             for m in fallbacks:
@@ -1192,6 +1206,13 @@ class GeminiAdapter(LLMProvider):
                 else:
                     contents.append(types.Content(role=target_role, parts=[part]))
             
+            if prompt:
+                part = types.Part.from_text(text=prompt)
+                if contents and contents[-1].role == "user":
+                    contents[-1].parts.append(part)
+                else:
+                    contents.append(types.Content(role="user", parts=[part]))
+
             # If vision context is provided, attach it to the final user message
             if image_base64 and len(contents) > 0 and contents[-1].role == "user":
                 import base64
@@ -1218,12 +1239,11 @@ class GeminiAdapter(LLMProvider):
             )
 
             fallbacks = [
-                'gemini-3.5-flash',
-                'gemini-3.1-flash-lite',
-                'gemini-2.5-flash-lite',
                 'gemini-2.5-flash',
+                'gemini-2.5-flash-lite',
                 'gemini-2.0-flash',
                 'gemini-1.5-flash',
+                'gemini-1.5-flash-8b',
             ]
             models_to_try = [self._resolve_primary_model(model_tier)]
             for m in fallbacks:
@@ -1242,6 +1262,11 @@ class GeminiAdapter(LLMProvider):
                         contents=current_contents,
                         config=config
                     )
+                    if generator is None:
+                        logger.warning(f"Model '{model}' returned a None stream — skipping to next fallback.")
+                        fallback_manager.mark_failed(model, "None stream returned")
+                        last_error = RuntimeError(f"Model '{model}' returned None stream.")
+                        continue
                     fallback_manager.mark_success(model)
                     think_stripper = ThinkStripper()
                     async for chunk in generator:

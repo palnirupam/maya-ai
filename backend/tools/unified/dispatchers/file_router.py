@@ -2,6 +2,8 @@
 import asyncio
 import os
 from ..handlers.file_ops import handle_file
+from backend.brain.language_style import get_latest_conversation_style
+from backend.brain.language_policy_enforcer import enforce_style
 
 # Extracted text past this length gets compacted into a "fast" tier summary
 # instead of being resent raw (and re-resent on every later turn — see
@@ -30,13 +32,38 @@ async def file(action: str = "", src: str = "", dst: str = "", name: str = "", n
       mkdir path          — Create folder
       read src            — Read a file (text, PDF, DOCX, or image-via-OCR).
                              Large results are auto-summarized to save tokens.
+      open src|name       — Open a browser-supported local file in the default
+                             browser; a filename is searched across all drives.
       write src content   — Write text file (pass content in dst)
       ls [path]           — List directory contents
       search name [n]     — Find files by name across all drives
       delete_by_name name [n] — Find+delete by name (n=max results, default 5)
       organize path       — Auto-organize folder by type
+      
+      # NEW: Compression operations (zero API cost)
+      compress src dst    — Compress folder/file to archive (auto-detects format: .zip, .tar.gz, .tar.bz2)
+      extract src [dst]   — Extract archive to destination folder
+      list_archive src    — List archive contents without extracting
+      compress_files name dst — Compress specific files (name = comma-separated paths)
     """
-    result = await asyncio.to_thread(handle_file, action, src, dst, name, n, path)
+    # Handle compression operations
+    from ..handlers.compression_ops import handle_compression
+    compression_actions = ("compress", "extract", "compress_files")
+    if action in compression_actions:
+        result = await asyncio.to_thread(handle_compression, action, src, dst, name)
+    elif action == "list_archive":
+        # Map to correct action name in handler
+        result = await asyncio.to_thread(handle_compression, "list", src, dst, name)
+    else:
+        result = await asyncio.to_thread(handle_file, action, src, dst, name, n, path)
+
+    # Enforce language consistency on file operation results
+    try:
+        current_style = get_latest_conversation_style()
+        if isinstance(result, str) and current_style != "english":
+            result = enforce_style(result, current_style)
+    except Exception:
+        pass  # Language enforcement is best-effort
 
     if action == "read" and isinstance(result, str) and not result.startswith("ERR:") \
             and len(result) > _SUMMARY_THRESHOLD:

@@ -74,9 +74,29 @@ class MCPServerBase:
         self._health_check_task = None
         self.session: ClientSession | None = None
         self._tools = []
+        self._background_tasks: set[asyncio.Task] = set()
+    
+    def _track_task(self, task: asyncio.Task) -> asyncio.Task:
+        """Track a background task and automatically remove it when done."""
+        self._background_tasks.add(task)
+        task.add_done_callback(lambda t: self._background_tasks.discard(t))
+        # Log any exceptions
+        def _log_exception(t: asyncio.Task) -> None:
+            try:
+                if not t.cancelled() and t.exception() is not None:
+                    logger.error(
+                        "MCP background task %s raised exception: %s",
+                        t.get_name(),
+                        t.exception(),
+                        exc_info=t.exception()
+                    )
+            except Exception:
+                pass
+        task.add_done_callback(_log_exception)
+        return task
     
     async def start(self):
-        self._health_check_task = asyncio.create_task(self._health_check_loop())
+        self._health_check_task = self._track_task(asyncio.create_task(self._health_check_loop()))
         await self.restart()
 
     async def shutdown(self):
@@ -171,7 +191,7 @@ class StdioMCPServer(MCPServerBase):
                 self._connection_task.cancel()
                 
         self._shutdown_event.clear()
-        self._connection_task = asyncio.create_task(self._run_connection())
+        self._connection_task = self._track_task(asyncio.create_task(self._run_connection()))
         # We don't await session.initialize here, the task does it. 
         # But restart() expects session to be ready to list tools.
         # Wait until session is populated by the task.
@@ -229,7 +249,7 @@ class SSEMCPServer(MCPServerBase):
                 self._connection_task.cancel()
                 
         self._shutdown_event.clear()
-        self._connection_task = asyncio.create_task(self._run_connection())
+        self._connection_task = self._track_task(asyncio.create_task(self._run_connection()))
         
         for _ in range(self.config.startup_timeout_seconds * 10):
             if self.session:
@@ -269,6 +289,26 @@ class MCPService:
     def __init__(self):
         self.servers: dict[str, MCPServerBase] = {}
         self.config_path = os.path.join(os.path.dirname(__file__), "..", "config", "mcp_servers.json")
+        self._background_tasks: set[asyncio.Task] = set()
+    
+    def _track_task(self, task: asyncio.Task) -> asyncio.Task:
+        """Track a background task and automatically remove it when done."""
+        self._background_tasks.add(task)
+        task.add_done_callback(lambda t: self._background_tasks.discard(t))
+        # Log any exceptions
+        def _log_exception(t: asyncio.Task) -> None:
+            try:
+                if not t.cancelled() and t.exception() is not None:
+                    logger.error(
+                        "MCP service background task %s raised exception: %s",
+                        t.get_name(),
+                        t.exception(),
+                        exc_info=t.exception()
+                    )
+            except Exception:
+                pass
+        task.add_done_callback(_log_exception)
+        return task
 
     async def start(self):
         if not os.path.exists(self.config_path):
@@ -288,7 +328,7 @@ class MCPService:
                     
                 self.servers[name] = server
                 # Start non-blocking
-                asyncio.create_task(self._safe_start(server))
+                self._track_task(asyncio.create_task(self._safe_start(server)))
             except Exception as e:
                 logger.error(f"Failed to configure MCP server {name}: {e}")
 

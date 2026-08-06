@@ -1,6 +1,7 @@
 from ...tools.desktop.mouse import mouse_tools
 from ...tools.desktop.keyboard import keyboard_tools
 from ...vision.capture.screen_capture import screen_capture
+from ...vision.capture.webcam_capture import capture_camera_preview
 
 from ...tools.desktop.apps import open_app, close_app, close_apps_except, focus_app, list_open_apps, open_chrome_profile
 from ...tools.desktop.advanced.browser_tools import open_url, search_youtube, search_google, gmail_action, send_background_email, read_background_email, trash_background_email, permanent_delete_email
@@ -108,6 +109,7 @@ CAPABILITY_MAP = {
         pause_media, setup_missing_tool, whatsapp_ui_send_message,
         find_and_click, wait_for_element, read_active_window_title,
         is_app_open, take_verified_screenshot,
+        capture_camera_preview,
         play_youtube_background, stop_youtube_background,
         delete_contact,
         perform_shortcut, control_brightness, control_display, manage_window,

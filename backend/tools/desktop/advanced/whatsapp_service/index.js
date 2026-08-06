@@ -232,11 +232,55 @@ async function startClient(pairingPhone) {
 
         // Fetch sender name and real phone number
         let senderName = senderNumber;
+        let contact = null;
         try {
-            const contact = await msg.getContact();
-            if (contact.number) senderNumber = contact.number.replace(/@.*$/, '');
-            senderName = contact.name || contact.pushname || senderNumber;
+            contact = await msg.getContact();
+            if (contact) {
+                if (contact.number) senderNumber = contact.number.replace(/\D/g, '');
+                senderName = contact.name || contact.pushname || senderName;
+            }
         } catch (_) {}
+
+        // Meta WhatsApp LID (Linked Identity ID) resolution:
+        // Meta assigns 14+ digit internal LID identifiers (e.g. 35854403801220@lid) for linked devices / privacy.
+        // If senderNumber is an LID, resolve the real phone number (@c.us) via chat ID or phonebook match.
+        const isLid = rawSender.endsWith('@lid') || (contact?.id?.server === 'lid') || (senderNumber.length > 13) || (senderNumber.startsWith('1') && senderNumber.length > 11);
+        if (isLid) {
+            let resolvedNum = null;
+            if (!isGroup && chatId.endsWith('@c.us')) {
+                resolvedNum = chatId.replace(/\D/g, '');
+            }
+            if (!resolvedNum || resolvedNum.length > 13) {
+                try {
+                    const chat = await msg.getChat();
+                    if (chat && chat.id && chat.id.server === 'c.us') {
+                        resolvedNum = chat.id.user.replace(/\D/g, '');
+                    }
+                } catch (_) {}
+            }
+            if ((!resolvedNum || resolvedNum.length > 13) && senderName && senderName !== senderNumber) {
+                try {
+                    const allContacts = await c.getContacts();
+                    const targetName = senderName.toLowerCase();
+                    for (const pc of allContacts) {
+                        if (pc.id?.server === 'c.us') {
+                            const pName = (pc.name || pc.pushname || '').toLowerCase();
+                            if (pName && (pName === targetName || pName.includes(targetName) || targetName.includes(pName))) {
+                                const num = (pc.number || pc.id.user || '').replace(/\D/g, '');
+                                if (num && num.length >= 8 && num.length <= 13) {
+                                    resolvedNum = num;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } catch (_) {}
+            }
+            if (resolvedNum && resolvedNum.length >= 8 && resolvedNum.length <= 13) {
+                console.log(`[WA-LID] Resolved LID ${senderNumber} -> Real Phone Number: ${resolvedNum}`);
+                senderNumber = resolvedNum;
+            }
+        }
 
         // Skip blocked senders (re-check with real number)
         if (blockedSenders.has(senderNumber)) return;

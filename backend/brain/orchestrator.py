@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Dict
 from .providers.base import LLMProvider
@@ -178,7 +179,12 @@ class ConversationOrchestrator:
             ))
             raise
         finally:
-            active_session_id.reset(token)
+            try:
+                active_session_id.reset(token)
+            except ValueError as e:
+                # Handle context token error when task is cancelled or context changed
+                logger.debug(f"[Orchestrator] Context token reset failed (task cancelled): {e}")
+                pass
 
     async def process_user_input_stream(self, session_id: str, text: str, image_base64: str = None):
         """Process input and stream the response back in chunks, delegating to the Multi-Agent team workflow."""
@@ -199,18 +205,63 @@ class ConversationOrchestrator:
             context_history = await self._prepare_session_context(session_id)
 
             from .agents import agent_team
+            from .progress_tracker import ProgressTracker
 
-            async for chunk in agent_team.execute_workflow(
-                session_id=session_id,
-                text=text,
-                context_history=context_history,
-                image_base64=image_base64
-            ):
-                # chunks can be str (text) or dict (events). Only count str chars.
-                if isinstance(chunk, str):
-                    output_char_count += len(chunk)
-                    assistant_chunks.append(chunk)
-                yield chunk
+            # Store all events for later emission (SIMPLIFIED - sync callbacks)
+            events_queue = []
+            
+            def _queue_progress_event(event):
+                """Queue progress event for emission (sync callback)."""
+                events_queue.append({
+                    "type": "progress_event",
+                    "data": {
+                        "step_number": event.step_number,
+                        "total_steps": event.total_steps,
+                        "progress_percent": event.progress_percent,  # FIXED: was 'percentage'
+                        "agent": event.agent,
+                        "stage": event.stage.value if event.stage else "",
+                        "elapsed_time": event.elapsed_time,  # FIXED: was 'eta_seconds'
+                        "action": event.action,
+                        "metadata": event.metadata,
+                    }
+                })
+                return None  # Sync function, no coroutine
+            
+            def _queue_tool_event(event_data):
+                """Queue tool execution event for emission (sync callback)."""
+                events_queue.append(event_data)
+                return None  # Sync function, no coroutine
+            
+            progress_tracker = ProgressTracker()
+            progress_tracker.add_callback(_queue_progress_event)
+
+            try:
+                async for chunk in agent_team.execute_workflow(
+                    session_id=session_id,
+                    text=text,
+                    context_history=context_history,
+                    image_base64=image_base64,
+                    progress_tracker=progress_tracker,
+                    tool_event_callback=_queue_tool_event
+                ):
+                    # Store progress_tracker reference for cancellation (NEW)
+                    current_task = asyncio.current_task()
+                    if current_task:
+                        current_task._progress_tracker = progress_tracker
+                    
+                    # Emit any queued events first
+                    while events_queue:
+                        yield events_queue.pop(0)
+                    
+                    # chunks can be str (text) or dict (events). Only count str chars.
+                    if isinstance(chunk, str):
+                        output_char_count += len(chunk)
+                        assistant_chunks.append(chunk)
+                    yield chunk
+            except GeneratorExit:
+                # Handle generator cancellation gracefully
+                logger.debug(f"[Orchestrator] Stream generator cancelled for session {session_id}")
+                raise
 
             assistant_text = "".join(assistant_chunks).strip()
             if assistant_text:
@@ -285,6 +336,11 @@ class ConversationOrchestrator:
                 pass
             raise
         finally:
-            active_session_id.reset(token)
+            try:
+                active_session_id.reset(token)
+            except ValueError as e:
+                # Handle context token error when task is cancelled or context changed
+                logger.debug(f"[Orchestrator] Context token reset failed (task cancelled): {e}")
+                pass
 
 orchestrator = ConversationOrchestrator()

@@ -100,10 +100,10 @@ def _load_gmail_credentials() -> tuple[str, str]:
                 UserPreferences.key == "GMAIL_APP_PASSWORD"
             ).first()
             if email_pref and password_pref:
-                gmail_user = crypto_manager.decrypt(email_pref.value)
-                gmail_password = crypto_manager.decrypt(password_pref.value)
+                gmail_user = crypto_manager.decrypt(email_pref.value, raise_on_failure=True)
+                gmail_password = crypto_manager.decrypt(password_pref.value, raise_on_failure=True)
         except Exception as exc:
-            logger.warning("Gmail credential lookup failed (%s).", type(exc).__name__)
+            logger.warning("Gmail credential lookup failed (%s, raise_on_failure=True).", type(exc).__name__)
             return "", ""
         finally:
             if db is not None:
@@ -331,8 +331,8 @@ def _legacy_send_background_email(to_recipient: str, subject: str, body: str, at
             email_pref = db.query(UserPreferences).filter(UserPreferences.key == "GMAIL_EMAIL").first()
             pass_pref = db.query(UserPreferences).filter(UserPreferences.key == "GMAIL_APP_PASSWORD").first()
             if email_pref and pass_pref:
-                gmail_user = crypto_manager.decrypt(email_pref.value)
-                gmail_password = crypto_manager.decrypt(pass_pref.value)
+                gmail_user = crypto_manager.decrypt(email_pref.value, raise_on_failure=True)
+                gmail_password = crypto_manager.decrypt(pass_pref.value, raise_on_failure=True)
         except Exception as db_err:
             return f"ERROR: Failed to fetch credentials from DB. {db_err}"
         finally:
@@ -442,8 +442,8 @@ async def _legacy_read_background_email(limit: int = 5, unread_only: bool = True
                 email_pref = db.query(UserPreferences).filter(UserPreferences.key == "GMAIL_EMAIL").first()
                 pass_pref = db.query(UserPreferences).filter(UserPreferences.key == "GMAIL_APP_PASSWORD").first()
                 if email_pref and pass_pref:
-                    gmail_user = crypto_manager.decrypt(email_pref.value)
-                    gmail_password = crypto_manager.decrypt(pass_pref.value)
+                    gmail_user = crypto_manager.decrypt(email_pref.value, raise_on_failure=True)
+                    gmail_password = crypto_manager.decrypt(pass_pref.value, raise_on_failure=True)
             except Exception as db_err:
                 return f"ERROR: Failed to fetch credentials from DB. {db_err}"
             finally:
@@ -624,8 +624,8 @@ async def _legacy_trash_background_email(uid: str, subject: str, from_sender: st
                 email_pref = db.query(UserPreferences).filter(UserPreferences.key == "GMAIL_EMAIL").first()
                 pass_pref = db.query(UserPreferences).filter(UserPreferences.key == "GMAIL_APP_PASSWORD").first()
                 if email_pref and pass_pref:
-                    gmail_user = crypto_manager.decrypt(email_pref.value)
-                    gmail_password = crypto_manager.decrypt(pass_pref.value)
+                    gmail_user = crypto_manager.decrypt(email_pref.value, raise_on_failure=True)
+                    gmail_password = crypto_manager.decrypt(pass_pref.value, raise_on_failure=True)
             except Exception as db_err:
                 return f"ERROR: Failed to fetch credentials from DB. {db_err}"
             finally:
@@ -745,8 +745,8 @@ async def _legacy_permanent_delete_email(uid: str, subject: str, from_sender: st
                 email_pref = db.query(UserPreferences).filter(UserPreferences.key == "GMAIL_EMAIL").first()
                 pass_pref = db.query(UserPreferences).filter(UserPreferences.key == "GMAIL_APP_PASSWORD").first()
                 if email_pref and pass_pref:
-                    gmail_user = crypto_manager.decrypt(email_pref.value)
-                    gmail_password = crypto_manager.decrypt(pass_pref.value)
+                    gmail_user = crypto_manager.decrypt(email_pref.value, raise_on_failure=True)
+                    gmail_password = crypto_manager.decrypt(pass_pref.value, raise_on_failure=True)
             except Exception as db_err:
                 return f"ERROR: Failed to fetch credentials from DB. {db_err}"
             finally:

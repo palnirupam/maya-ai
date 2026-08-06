@@ -18,6 +18,13 @@ logger = logging.getLogger(__name__)
 # as a real user turn and Maya replies unprompted.
 import re as _re
 
+# Whisper exposes per-segment noise-confidence signals that we gate on to drop
+# transcripts hallucinated from silence/ambient noise. Reject only when BOTH
+# signals agree it is noise, so genuine mixed-language (Banglish/Hindi) speech —
+# which scores moderately — is not thrown away.
+_WHISPER_NO_SPEECH_MAX = 0.6   # mean no_speech_prob above this = likely silence
+_WHISPER_AVG_LOGPROB_MIN = -0.8  # mean avg_logprob below this = low confidence
+
 _HALLUCINATION_PHRASES = {
     "you", "thank you", "thank you.", "thanks", "thanks for watching",
     "thanks for watching!", "thank you for watching", "please subscribe",
@@ -25,7 +32,30 @@ _HALLUCINATION_PHRASES = {
     "so", "uh", "um", "hmm", "hm", "yeah", "the", "a", "i", "oh",
     "silence", "[silence]", "[music]", "[music playing]", "music",
     "dhonnobad", "thik ache", "accha",
+    "the speaker may use english, bengali, hindi, or a mix",
+    "the speaker may use english, bengali or a mix",
+    "please talk here", "please talk to me in the okay",
+    "i will help i can get a english speaker",
+    "aap kaise hain", "hello maya how are you please do this now",
 }
+
+
+def _collapse_repeats(words: list[str]) -> list[str]:
+    """Collapse an immediately-repeating phrase down to a single copy.
+
+    Whisper loops on silence/noise and emits the same short phrase back to back
+    ("aap kaise hain aap kaise hain aap kaise hain ..."). We try phrase lengths
+    1..4 and, if the whole token list is that phrase repeated 2+ times, return
+    just one copy so the membership check below can catch it.
+    """
+    n = len(words)
+    for size in range(1, 5):
+        if n < size * 2 or n % size != 0:
+            continue
+        phrase = words[:size]
+        if all(words[i:i + size] == phrase for i in range(0, n, size)):
+            return phrase
+    return words
 
 
 def _is_probable_hallucination(text: str) -> bool:
@@ -39,6 +69,18 @@ def _is_probable_hallucination(text: str) -> bool:
         return True
     if normalized in _HALLUCINATION_PHRASES:
         return True
+
+    words = normalized.split()
+    # A back-to-back repeated phrase ("aap kaise hain" x4) collapses to one copy;
+    # re-check membership so listed phrases are caught regardless of repeat count.
+    collapsed = " ".join(_collapse_repeats(words))
+    if collapsed != normalized and collapsed in _HALLUCINATION_PHRASES:
+        return True
+    # Novel repeated garbage won't be in the list, but it has very few distinct
+    # words relative to its length. Genuine commands sit near a 1.0 ratio.
+    if len(words) >= 4 and len(set(words)) / len(words) <= 0.4:
+        return True
+
     # A meaningful command has real letters; a clip of just punctuation/symbols
     # (".", "...", "♪") carries no intent.
     if not _re.search(r"[a-z0-9ঀ-৿ऀ-ॿ]", normalized):
@@ -87,7 +129,7 @@ def _get_gemini_api_key() -> Optional[str]:
                     model_mod.UserPreferences.key == "GEMINI_API_KEY"
                 ).first()
                 if pref and pref.value:
-                    key = crypto_mod.crypto_manager.decrypt(pref.value).strip()
+                    key = crypto_mod.crypto_manager.decrypt(pref.value, raise_on_failure=True).strip()
                     break
             finally:
                 db.close()
@@ -241,7 +283,7 @@ class Transcriber:
                     samples = struct.unpack(f"<{len(frames)//2}h", frames)
                     max_amp = max(abs(s) for s in samples) if samples else 0
                     logger.info(f"[Transcriber] Max amplitude: {max_amp}/32768")
-                    if max_amp < 100:
+                    if max_amp < 500:
                         logger.warning(
                             "[Transcriber] Audio is nearly silent — "
                             "ignoring it instead of asking STT to guess."
@@ -286,22 +328,57 @@ class Transcriber:
 
         try:
             def _run_whisper():
-                segments, _ = self.model.transcribe(
+                segments, info = self.model.transcribe(
                     audio_data,
                     beam_size=3,
                     language=None,
                     vad_filter=False,
                     initial_prompt=(
-                        "Hello Maya, how are you? Please do this now. "
-                        "Maya, kemon acho? Ekhon eta kore dao. "
-                        "Namaste Maya, aap kaise hain? Abhi ye kar do. "
-                        "The speaker may use English, Bengali, Hindi, or a mix."
+                        "Hello Maya. Maya, kemon acho? Ekhon eta kore dao. "
+                        "Namaste Maya, aap kaise hain? Abhi ye kar do."
                     ),
                 )
-                return "".join(seg.text for seg in segments)
+                # Consume the lazy generator once, keeping text + confidence.
+                parts, no_speech, logprobs = [], [], []
+                for seg in segments:
+                    parts.append(seg.text)
+                    if seg.no_speech_prob is not None:
+                        no_speech.append(seg.no_speech_prob)
+                    if seg.avg_logprob is not None:
+                        logprobs.append(seg.avg_logprob)
+                lang_prob = getattr(info, "language_probability", None)
+                return "".join(parts), no_speech, logprobs, lang_prob
 
-            text = latinize_transcript(await asyncio.to_thread(_run_whisper))
-            logger.info(f"[Transcriber][Whisper] Transcribed: {text}")
+            raw_text, no_speech, logprobs, lang_prob = await asyncio.to_thread(_run_whisper)
+
+            # Confidence gate: drop transcripts Whisper likely invented from noise.
+            # Require BOTH signals to agree so genuine mixed-language speech survives.
+            mean_no_speech = sum(no_speech) / len(no_speech) if no_speech else 0.0
+            mean_logprob = sum(logprobs) / len(logprobs) if logprobs else 0.0
+            if (
+                no_speech
+                and logprobs
+                and mean_no_speech > _WHISPER_NO_SPEECH_MAX
+                and mean_logprob < _WHISPER_AVG_LOGPROB_MIN
+            ):
+                logger.warning(
+                    "[Transcriber] Whisper low-confidence (no_speech=%.2f, "
+                    "avg_logprob=%.2f, lang_prob=%s) — ignoring as noise: %r",
+                    mean_no_speech, mean_logprob, lang_prob, raw_text.strip(),
+                )
+                if wav_path_to_cleanup and os.path.exists(wav_path_to_cleanup):
+                    try:
+                        os.remove(wav_path_to_cleanup)
+                    except Exception:
+                        pass
+                return ""
+
+            text = latinize_transcript(raw_text)
+            logger.info(
+                "[Transcriber][Whisper] Transcribed (no_speech=%.2f, avg_logprob=%.2f, "
+                "lang_prob=%s): %s",
+                mean_no_speech, mean_logprob, lang_prob, text,
+            )
         except Exception as e:
             logger.error(f"[Transcriber] Whisper error: {e}")
             text = ""

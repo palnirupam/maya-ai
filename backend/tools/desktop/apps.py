@@ -32,22 +32,41 @@ _UNSAFE_APP_QUERY_RE = re.compile(r"[;&|`$%<>^\\/()]|\r|\n")
 
 # Common spoken/typed variants that should resolve before fuzzy matching.
 APP_NAME_ALIASES = {
+    "camara": "camera",
+    # WhatsApp variations and typos
     "wa": "whatsapp",
     "whatapp": "whatsapp",
     "whatsap": "whatsapp",
     "watsapp": "whatsapp",
     "whats app": "whatsapp",
+    "wapp": "whatsapp",
+    "wp": "whatsapp",
+    "wap": "whatsapp",
+    # YouTube variations and typos
     "yt": "youtube",
+    "ytt": "youtube",
+    "yttt": "youtube",
+    "youtub": "youtube",
+    "youtoob": "youtube",
+    "youtbe": "youtube",
+    "youttube": "youtube",
     "yt video": "youtube",
     "youtube video": "youtube",
     "yt song": "youtube",
     "youtube song": "youtube",
     "yt music": "youtube",
     "youtube music": "youtube",
+    "yt te": "youtube",
+    "ytt te": "youtube",
+    # System apps
     "cmd prompt": "cmd",
     "command prompt": "cmd",
     "files": "file explorer",
     "file manager": "file explorer",
+    # Browser typos
+    "crome": "chrome",
+    "chrom": "chrome",
+    "gogle chrome": "chrome",
 }
 
 APP_COMMAND_WORDS = {
@@ -220,18 +239,132 @@ def _is_protected_app_query(value: str) -> bool:
     return " ".join(words) in {"maya", "maya ai"}
 
 
+def _ai_understand_app_name(query: str) -> str | None:
+    """Use AI to understand app name from typos/variations.
+    
+    Examples:
+    - "yootuub" → "youtube"
+    - "whattsap" → "whatsapp"
+    - "cromee" → "chrome"
+    - "vscod" → "vscode"
+    
+    This is a fast, cached fallback for when regex patterns fail.
+    Uses a tiny prompt to avoid quota waste.
+    """
+    from functools import lru_cache
+    
+    # Cache results to avoid repeated LLM calls for same typo
+    @lru_cache(maxsize=200)
+    def _cached_ai_understand(q: str) -> str | None:
+        try:
+            from dotenv import load_dotenv
+            import google.generativeai as genai
+            import os
+            
+            # Load .env if not already loaded
+            load_dotenv()
+            
+            api_key = os.getenv("GEMINI_API_KEY")
+            if not api_key:
+                logger.debug("AI app understanding skipped: No GEMINI_API_KEY")
+                return None
+            
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemini-2.0-flash-exp")
+            
+            # Ultra-minimal prompt to save tokens
+            prompt = f"""App name typo correction. Return ONLY the correct app name, nothing else.
+
+Known apps: chrome, firefox, edge, whatsapp, youtube, vscode, notepad, calculator, spotify, discord, telegram, excel, word, powerpoint, outlook, teams, zoom, slack, github
+
+User typed: "{q}"
+Correct app name:"""
+            
+            response = model.generate_content(
+                prompt,
+                generation_config=genai.GenerationConfig(
+                    max_output_tokens=20,
+                    temperature=0.1,
+                )
+            )
+            
+            result = response.text.strip().lower()
+            
+            # Validate it's a real app name
+            known_apps = {
+                "chrome", "firefox", "edge", "browser",
+                "whatsapp", "wa", "telegram", "discord", "slack",
+                "youtube", "spotify", "vlc",
+                "vscode", "notepad", "sublime", "atom",
+                "calculator", "calc", "paint",
+                "excel", "word", "powerpoint", "outlook", "teams",
+                "zoom", "skype",
+                "github", "git",
+            }
+            
+            if result in known_apps or result in APP_NAME_ALIASES.values():
+                logger.info(f"[AI App Understanding] '{q}' → '{result}'")
+                return result
+            
+        except Exception as e:
+            logger.debug(f"AI app understanding failed for '{q}': {e}")
+        
+        return None
+    
+    return _cached_ai_understand(query.lower().strip())
+
+
 def _normalize_app_query(app_name: str) -> str:
+    """Normalize app name with fallback to AI understanding for typos/variations.
+    
+    HYBRID APPROACH:
+    1. Try exact alias match (fast)
+    2. Try fuzzy string matching (medium)
+    3. Fallback to LLM understanding (smart, handles any typo/variation)
+    """
     if not _is_safe_app_query(app_name):
         return ""
     if _is_protected_app_query(app_name):
         return "maya ai"
     raw = _simple_name(app_name)
+    
+    # Step 1: Exact alias match (instant)
     if raw in APP_NAME_ALIASES:
         return APP_NAME_ALIASES[raw]
 
     words = [w for w in raw.split() if w not in APP_COMMAND_WORDS]
     cleaned = " ".join(words).strip()
-    return APP_NAME_ALIASES.get(cleaned, cleaned)
+    
+    if cleaned in APP_NAME_ALIASES:
+        return APP_NAME_ALIASES[cleaned]
+    
+    # Step 2: Fuzzy matching against known apps (handles minor typos)
+    try:
+        from rapidfuzz import process, fuzz
+        # Check aliases first
+        alias_match = process.extractOne(
+            cleaned.lower(),
+            [k.lower() for k in APP_NAME_ALIASES.keys()],
+            scorer=fuzz.ratio,
+            score_cutoff=80.0  # 80% similarity
+        )
+        if alias_match:
+            matched_key = alias_match[0]
+            # Find original key (case-insensitive)
+            for k in APP_NAME_ALIASES:
+                if k.lower() == matched_key:
+                    return APP_NAME_ALIASES[k]
+    except ImportError:
+        pass
+    
+    # Step 3: AI fallback for complex typos/variations
+    # Only if the query looks like it might be an app name
+    if len(cleaned) >= 2 and not cleaned.isdigit():
+        ai_result = _ai_understand_app_name(cleaned)
+        if ai_result:
+            return ai_result
+    
+    return cleaned
 
 
 def _best_registry_match(name_clean: str) -> tuple[str, float] | None:
@@ -904,14 +1037,16 @@ def close_apps_except(excluded_apps: str) -> str:
         excluded_apps (str): App names to keep open, separated by commas or
             ``and`` (for example, ``"VS Code"`` or ``"VS Code, Chrome"``).
 
-    This deliberately closes windows instead of killing processes. It covers
-    regular and minimized app windows while leaving background and system
+    This closes windows first (gentle), then force-kills stubborn processes (taskkill).
+    Regular and minimized app windows are closed while leaving background and system
     processes alone.
 
     An empty ``excluded_apps`` means "close every non-protected app" — a plain
     "close all apps" request. Maya/runtime host windows are still always kept
     open regardless.
     """
+    import psutil
+    
     # Empty string is the legitimate "close everything" request; only reject it
     # when it actually carries unsafe shell/path characters.
     if excluded_apps and not _is_safe_app_query(excluded_apps):
@@ -932,6 +1067,7 @@ def close_apps_except(excluded_apps: str) -> str:
     failures = []
     kept = []
     protected_kept = []
+    stubborn_windows = []  # Windows that didn't close
 
     try:
         import pygetwindow as gw
@@ -940,6 +1076,7 @@ def close_apps_except(excluded_apps: str) -> str:
     except Exception as e:
         return f"ERROR: Could not inspect open app windows: {e}"
 
+    # Phase 1: Try gentle window.close()
     for window in windows:
         title = (getattr(window, "title", "") or "").strip()
         if not title:
@@ -960,6 +1097,7 @@ def close_apps_except(excluded_apps: str) -> str:
         except Exception as e:
             failures.append(f"{title}: {e}")
 
+    # Phase 2: Check which windows are still open (stubborn)
     if closed:
         try:
             requested_titles = set(closed)
@@ -972,31 +1110,94 @@ def close_apps_except(excluded_apps: str) -> str:
                     ),
                 )
             )
-            remaining = [title for title in closed if title in remaining_titles]
-            if remaining:
-                failures.extend(f"{title}: still open after close request" for title in remaining)
-                closed = [title for title in closed if title not in remaining_titles]
+            stubborn_windows = [title for title in closed if title in remaining_titles]
+            closed = [title for title in closed if title not in remaining_titles]
         except Exception as e:
             return (
                 f"PARTIAL: Requested close for {len(closed)} app window(s), "
                 f"but completion could not be verified: {e}"
             )
 
+    # Phase 3: Force-kill stubborn windows with taskkill
+    force_killed = []
+    if stubborn_windows and os.name == "nt":
+        logger.info(f"[CLOSE_ALL] {len(stubborn_windows)} stubborn windows detected, attempting force close...")
+        
+        # Get PIDs of windows that didn't close
+        try:
+            current_windows = gw.getAllWindows()
+            for window in current_windows:
+                title = (getattr(window, "title", "") or "").strip()
+                if title not in stubborn_windows:
+                    continue
+                
+                # Try to find the process owning this window
+                try:
+                    # Get window handle
+                    import win32gui
+                    import win32process
+                    
+                    hwnd = win32gui.FindWindow(None, title)
+                    if hwnd:
+                        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                        proc = psutil.Process(pid)
+                        
+                        # Don't kill system/protected processes
+                        if _is_system_process(proc) or _is_protected_runtime_process(proc):
+                            logger.debug(f"Skipping protected process for window: {title}")
+                            continue
+                        
+                        # Force kill with taskkill
+                        try:
+                            result = subprocess.run(
+                                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                                capture_output=True,
+                                text=True,
+                                timeout=5,
+                                **_subprocess_kwargs(),
+                            )
+                            if result.returncode == 0:
+                                if _wait_for_process_exit(proc):
+                                    force_killed.append(title)
+                                    stubborn_windows.remove(title)
+                                    logger.info(f"[CLOSE_ALL] Force-killed: {title} (PID {pid})")
+                                else:
+                                    failures.append(f"{title}: still running after taskkill")
+                            elif result.stderr.strip():
+                                failures.append(f"{title}: {result.stderr.strip()}")
+                        except Exception as e:
+                            failures.append(f"{title}: taskkill failed: {e}")
+                except Exception as e:
+                    logger.debug(f"Could not force-kill window {title}: {e}")
+                    failures.append(f"{title}: could not get PID for force close")
+        except Exception as e:
+            logger.warning(f"[CLOSE_ALL] Force close attempt failed: {e}")
+
+    # Update failures list with remaining stubborn windows
+    for title in stubborn_windows:
+        if not any(title in f for f in failures):
+            failures.append(f"{title}: still open after close request")
+
+    # Build result message
+    total_closed = len(closed) + len(force_killed)
     keep_label = ", ".join(excluded_names) if excluded_names else "nothing (all apps)"
     protected_note = (
         f" Protected Maya/runtime windows kept open: {len(protected_kept)}."
         if protected_kept
         else ""
     )
-    if closed and failures:
+    
+    if total_closed and failures:
+        force_note = f" ({len(force_killed)} force-killed)" if force_killed else ""
         return (
-            f"PARTIAL: Closed {len(closed)} app window(s): {', '.join(closed[:8])}. "
+            f"PARTIAL: Closed {total_closed} app window(s){force_note}: {', '.join((closed + force_killed)[:8])}. "
             f"Kept open: {keep_label}. Could not close {len(failures)} window(s)."
             f"{protected_note}"
         )
-    if closed:
+    if total_closed:
+        force_note = f" ({len(force_killed)} force-killed)" if force_killed else ""
         return (
-            f"SUCCESS: Closed {len(closed)} app window(s): {', '.join(closed[:8])}. "
+            f"SUCCESS: Closed {total_closed} app window(s){force_note}: {', '.join((closed + force_killed)[:8])}. "
             f"Kept open: {keep_label}.{protected_note}"
         )
     if failures:

@@ -42,8 +42,8 @@ def forget_fact(topic: str) -> str:
                 if decrypted_category == topic_lower:
                     db.delete(mem)
                     deleted_count += 1
-            except:
-                pass
+            except Exception as e:
+                logger.warning("Failed to decrypt memory category for memory id=%s: %s", mem.id, e)
         db.commit()
         if deleted_count > 0:
             return f"SUCCESS: Forgot {deleted_count} facts about {topic}."

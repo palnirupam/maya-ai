@@ -1,6 +1,8 @@
 import logging
 from ..providers.gemini_adapter import gemini_adapter
 
+logger = logging.getLogger(__name__)
+
 def _declared_tool_names(tool) -> tuple[str, ...]:
     """Return function names exposed by a native or provider-neutral tool."""
     native_name = getattr(tool, "__name__", None)
@@ -64,56 +66,155 @@ async def _summarize_completed_actions(agent_name: str, agent_context: list, age
         return f"[{agent_name}] Task completed after all allowed rounds."
 
 
-async def _run_tool(func_name: str, args: dict, all_tools: list, conversation_style: str = None) -> str:
-    """Execute a single tool call and return the result as a string."""
+async def _run_tool(
+    func_name: str,
+    args: dict,
+    all_tools: list,
+    conversation_style: str = None,
+    tool_event_callback=None
+) -> str:
+    """
+    Execute a single tool call and return the result as a string.
+
+    Args:
+        func_name: Name of the tool to execute
+        args: Arguments to pass to the tool
+        all_tools: List of available tool functions
+        conversation_style: Language style for response translation
+        tool_event_callback: Optional callback to emit tool execution events.
+                             Accepted as either sync (returns None) or async
+                             (returns coroutine) — both handled transparently.
+
+    Returns:
+        String result from tool execution
+    """
+    import time
+    import asyncio
+    import inspect
+
+    start_time = time.time()
+
+    # ── Internal helper: unified sync/async-safe event emitter ───────────────
+    async def _emit(event_data: dict) -> None:
+        """Call tool_event_callback, awaiting it if it returns a coroutine.
+        Never raises — a broken callback must not crash the tool execution."""
+        if not tool_event_callback:
+            return
+        try:
+            cb_result = tool_event_callback(event_data)
+            if asyncio.iscoroutine(cb_result):
+                await cb_result
+        except Exception as cb_exc:
+            logger.debug("[ToolExecutor] tool_event_callback raised: %s", cb_exc)
+
+    # ── 1. Emit: starting ─────────────────────────────────────────────────────
+    await _emit({
+        "type": "tool_execution",
+        "data": {
+            "tool_name": func_name,
+            "status": "starting",
+            "args": args,
+            "timestamp": start_time,
+        },
+    })
+
+    # ── 2. Resolve native function ────────────────────────────────────────────
     func = next(
         (t for t in all_tools if hasattr(t, "__name__") and t.__name__ == func_name),
-        None
+        None,
     )
+
+    # ── 3. MCP tool path (name contains "__") ────────────────────────────────
     if not func:
         if "__" in func_name:
             try:
                 from ...tools.mcp_service import mcp_service
                 result = await mcp_service.call_tool(func_name, args or {})
-                # Translate MCP tool response
+
                 if conversation_style:
                     from ._tool_response_translator import translate_tool_response
                     result = translate_tool_response(func_name, result, conversation_style)
+
+                await _emit({
+                    "type": "tool_execution",
+                    "data": {
+                        "tool_name": func_name,
+                        "status": "success",
+                        "result": str(result)[:200],
+                        "duration": time.time() - start_time,
+                        "timestamp": time.time(),
+                    },
+                })
                 return str(result)
+
             except Exception as e:
-                # Translate error message
+                await _emit({
+                    "type": "tool_execution",
+                    "data": {
+                        "tool_name": func_name,
+                        "status": "failed",
+                        "error": str(e),
+                        "duration": time.time() - start_time,
+                        "timestamp": time.time(),
+                    },
+                })
                 if conversation_style:
                     from ..language_style_enhanced import format_localized_error
                     error_msg = format_localized_error(e, conversation_style)
                     return f"MCP tool '{func_name}': {error_msg}"
                 return f"MCP tool '{func_name}' raised an error: {e}"
-        
-        # Translate "tool not available" message
-        if conversation_style:
-            from ..language_style_enhanced import get_localized_message
-            msg = get_localized_message("error", conversation_style)
-            if conversation_style == "banglish":
-                return f"Tool '{func_name}' available nei ba disable kora ache."
-            elif conversation_style == "hindilish":
-                return f"Tool '{func_name}' available nahi hai ya disable hai."
-            
+
+        # ── 4. Tool not found ─────────────────────────────────────────────────
+        await _emit({
+            "type": "tool_execution",
+            "data": {
+                "tool_name": func_name,
+                "status": "failed",
+                "error": "Tool not available or disabled",
+                "duration": time.time() - start_time,
+                "timestamp": time.time(),
+            },
+        })
+        if conversation_style == "banglish":
+            return f"Tool '{func_name}' available nei ba disable kora ache."
+        if conversation_style == "hindilish":
+            return f"Tool '{func_name}' available nahi hai ya disable hai."
         return f"Tool '{func_name}' is disabled or not available."
-        
+
+    # ── 5. Native tool execution ──────────────────────────────────────────────
     try:
-        import inspect
         if inspect.iscoroutinefunction(func):
             result = await func(**args)
         else:
             result = func(**args)
-            
-        # Translate tool response to match conversation style
+
         if conversation_style:
             from ._tool_response_translator import translate_tool_response
             result = translate_tool_response(func_name, result, conversation_style)
-            
+
+        await _emit({
+            "type": "tool_execution",
+            "data": {
+                "tool_name": func_name,
+                "status": "success",
+                "result": str(result)[:200],
+                "duration": time.time() - start_time,
+                "timestamp": time.time(),
+            },
+        })
         return str(result)
+
     except Exception as e:
-        # Translate error message
+        await _emit({
+            "type": "tool_execution",
+            "data": {
+                "tool_name": func_name,
+                "status": "failed",
+                "error": str(e),
+                "duration": time.time() - start_time,
+                "timestamp": time.time(),
+            },
+        })
         if conversation_style:
             from ..language_style_enhanced import format_localized_error
             error_msg = format_localized_error(e, conversation_style)

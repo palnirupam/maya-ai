@@ -24,7 +24,7 @@ class ToolManifest:
 
 file_manifest = ToolManifest(
     name="file",
-    description="All file operations in one tool: copy, move, rename, delete, read (text/PDF/DOCX/image-OCR, auto-summarized when large), write, ls, mkdir, search, organize.",
+    description="All file operations in one tool: copy, move, rename, delete, read, open browser-supported local files, write, ls, mkdir, search, organize.",
     category="filesystem",
     risk_tier="unsafe", # Because it can delete/overwrite, inherently unsafe for non-professional modes
     needs_semantic_verify=False,
@@ -33,7 +33,7 @@ file_manifest = ToolManifest(
 
 pc_manifest = ToolManifest(
     name="pc",
-    description="System control: volume, brightness, lock, mute, screenshot, sleep, shutdown, restart, clipboard, processes, battery, wifi, bluetooth.",
+    description="System control: volume, brightness, lock, mute, screenshot, camera photo, sleep, shutdown, restart, clipboard, processes, battery, wifi, bluetooth.",
     category="system",
     risk_tier="requires_approval", # Shutdown/restart need approval. The Intent Sentinel / Agent Team logic will handle granular action-level blocks.
     needs_semantic_verify=False,

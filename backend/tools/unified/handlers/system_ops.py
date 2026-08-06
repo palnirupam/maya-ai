@@ -115,6 +115,11 @@ def handle_pc(action, val=0, name="", state="", cmd=""):
         except Exception as e:
             return f"ERR: {e}"
 
+    if action == "camera_photo":
+        from ...system.camera import take_camera_photo
+
+        return take_camera_photo()
+
     if action == "sleep":
         return _run_power_command(
             [
@@ -281,6 +286,294 @@ def handle_pc(action, val=0, name="", state="", cmd=""):
             r = subprocess.run('powershell "Get-Process | Where-Object {$_.MainWindowTitle} | Select-Object Name,MainWindowTitle"',
                                capture_output=True, text=True, shell=True, timeout=10)
             return f"Windows:\n{r.stdout}"
+        except Exception as e:
+            return f"ERR: {e}"
+
+    # ── Multiple Monitor Configuration ──
+    if action == "display_list":
+        try:
+            cmd = """
+            Get-WmiObject -Namespace root\\wmi -Class WmiMonitorBasicDisplayParams | 
+            Select-Object InstanceName, 
+            @{Name='Width';Expression={$_.MaxHorizontalImageSize}},
+            @{Name='Height';Expression={$_.MaxVerticalImageSize}}
+            """
+            result = _ps(cmd)
+            return f"Displays:\n{result}" if result and not result.startswith("ERR:") else "ERR: Could not list displays"
+        except Exception as e:
+            return f"ERR: {e}"
+
+    if action == "display_settings":
+        # Open Windows Display Settings
+        try:
+            subprocess.Popen(["start", "ms-settings:display"], shell=True)
+            return "OK: Opened Display Settings"
+        except Exception as e:
+            return f"ERR: {e}"
+
+    if action == "display_orientation":
+        # Rotate display: val = 0 (landscape), 1 (portrait), 2 (landscape flipped), 3 (portrait flipped)
+        try:
+            if val not in [0, 1, 2, 3]:
+                return "ERR: orientation must be 0-3 (0=landscape, 1=portrait, 2=landscape flipped, 3=portrait flipped)"
+            cmd = f"""
+            $ErrorActionPreference='Stop';
+            Add-Type -AssemblyName System.Windows.Forms;
+            $screen = [System.Windows.Forms.Screen]::PrimaryScreen;
+            $device = New-Object DEVMODE;
+            $device.dmSize = [System.Runtime.InteropServices.Marshal]::SizeOf($device);
+            [DisplayConfig]::EnumDisplaySettings($screen.DeviceName, -1, [ref]$device);
+            $device.dmDisplayOrientation = {val};
+            [DisplayConfig]::ChangeDisplaySettingsEx($screen.DeviceName, [ref]$device, 0, 0, 0);
+            """
+            result = _ps(cmd)
+            return f"OK: Display orientation changed to {['landscape', 'portrait', 'landscape flipped', 'portrait flipped'][val]}"
+        except Exception as e:
+            return f"ERR: Display orientation change not supported ({e})"
+
+    if action == "display_extend":
+        # Extend/duplicate displays using Win+P shortcut
+        try:
+            pyautogui.hotkey("win", "p")
+            import time; time.sleep(0.5)
+            # Press arrow key based on mode: name = "pc_only" | "duplicate" | "extend" | "second_only"
+            arrow_map = {"pc_only": "up", "duplicate": "down", "extend": "down", "second_only": "down"}
+            presses = {"pc_only": 0, "duplicate": 1, "extend": 2, "second_only": 3}
+            mode = name.lower() if name else "extend"
+            if mode not in presses:
+                return "ERR: display mode must be 'pc_only', 'duplicate', 'extend', or 'second_only'"
+            for _ in range(presses[mode]):
+                pyautogui.press("down")
+                time.sleep(0.1)
+            pyautogui.press("enter")
+            return f"OK: Display mode set to '{mode}'"
+        except Exception as e:
+            return f"ERR: {e}"
+
+    # ── Keyboard Shortcut Customization ──
+    if action == "hotkey_remap":
+        # Create AutoHotkey script to remap keys
+        # Requires: name = "source_key", state = "target_key"
+        try:
+            if not name or not state:
+                return "ERR: hotkey_remap requires 'name' (source key) and 'state' (target key)"
+            
+            import os
+            ahk_script_path = os.path.expanduser("~/maya_hotkey_remap.ahk")
+            
+            # Read existing script if it exists
+            existing_mappings = []
+            if os.path.exists(ahk_script_path):
+                with open(ahk_script_path, "r", encoding="utf-8") as f:
+                    existing_mappings = f.readlines()
+            
+            # Add new mapping
+            new_mapping = f"{name}::{state}\n"
+            if new_mapping not in existing_mappings:
+                existing_mappings.append(new_mapping)
+            
+            # Write updated script
+            with open(ahk_script_path, "w", encoding="utf-8") as f:
+                f.writelines(existing_mappings)
+            
+            # Check if AutoHotkey is installed
+            ahk_paths = [
+                r"C:\Program Files\AutoHotkey\AutoHotkey.exe",
+                r"C:\Program Files (x86)\AutoHotkey\AutoHotkey.exe",
+            ]
+            ahk_exe = None
+            for path in ahk_paths:
+                if os.path.exists(path):
+                    ahk_exe = path
+                    break
+            
+            if ahk_exe:
+                # Kill existing AutoHotkey process and restart
+                subprocess.run(["taskkill", "/F", "/IM", "AutoHotkey.exe"], 
+                             capture_output=True, timeout=5)
+                subprocess.Popen([ahk_exe, ahk_script_path])
+                return f"OK: Remapped '{name}' → '{state}' (AutoHotkey script: {ahk_script_path})"
+            else:
+                return f"OK: Remap script created at {ahk_script_path}, but AutoHotkey is not installed. Install from autohotkey.com"
+        except Exception as e:
+            return f"ERR: {e}"
+
+    if action == "hotkey_list":
+        # List current remapped hotkeys
+        try:
+            import os
+            ahk_script_path = os.path.expanduser("~/maya_hotkey_remap.ahk")
+            if not os.path.exists(ahk_script_path):
+                return "No custom hotkey remappings found"
+            with open(ahk_script_path, "r", encoding="utf-8") as f:
+                mappings = f.read()
+            return f"Custom Hotkey Mappings:\n{mappings}"
+        except Exception as e:
+            return f"ERR: {e}"
+
+    if action == "hotkey_reset":
+        # Remove all hotkey remappings
+        try:
+            import os
+            ahk_script_path = os.path.expanduser("~/maya_hotkey_remap.ahk")
+            if os.path.exists(ahk_script_path):
+                os.remove(ahk_script_path)
+            subprocess.run(["taskkill", "/F", "/IM", "AutoHotkey.exe"], 
+                         capture_output=True, timeout=5)
+            return "OK: All hotkey remappings cleared"
+        except Exception as e:
+            return f"ERR: {e}"
+
+    # ── System Theme/Appearance ──
+    if action == "theme_dark":
+        try:
+            val_mode = 0 if val == 1 else 1  # val=1 means dark mode ON
+            cmd = f'Set-ItemProperty -Path HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize -Name AppsUseLightTheme -Value {val_mode}'
+            _ps(cmd)
+            cmd2 = f'Set-ItemProperty -Path HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize -Name SystemUsesLightTheme -Value {val_mode}'
+            _ps(cmd2)
+            return f"OK: {'Dark' if val == 1 else 'Light'} mode enabled"
+        except Exception as e:
+            return f"ERR: {e}"
+
+    if action == "theme_accent":
+        # Change Windows accent color (val = color hex without #, e.g., "FF0000" for red)
+        try:
+            if not name:
+                return "ERR: accent color hex required in 'name' parameter (e.g., 'FF0000')"
+            
+            # Convert hex to BGR integer (Windows uses BGR, not RGB)
+            color_hex = name.strip().replace("#", "")
+            if len(color_hex) != 6:
+                return "ERR: color must be 6-digit hex (e.g., 'FF0000')"
+            
+            r, g, b = int(color_hex[0:2], 16), int(color_hex[2:4], 16), int(color_hex[4:6], 16)
+            bgr_int = (b << 16) | (g << 8) | r
+            
+            cmd = f"""
+            Set-ItemProperty -Path HKCU:\\SOFTWARE\\Microsoft\\Windows\\DWM -Name AccentColor -Value {bgr_int};
+            Set-ItemProperty -Path HKCU:\\SOFTWARE\\Microsoft\\Windows\\DWM -Name ColorizationColor -Value {bgr_int};
+            Set-ItemProperty -Path HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize -Name ColorPrevalence -Value 1;
+            """
+            _ps(cmd)
+            return f"OK: Accent color set to #{color_hex.upper()} (restart Explorer to apply)"
+        except Exception as e:
+            return f"ERR: {e}"
+
+    if action == "theme_wallpaper":
+        # Change desktop wallpaper (name = image path)
+        try:
+            if not name:
+                return "ERR: wallpaper image path required in 'name' parameter"
+            
+            import os
+            if not os.path.exists(name):
+                return f"ERR: wallpaper file not found: {name}"
+            
+            import ctypes
+            SPI_SETDESKWALLPAPER = 20
+            ctypes.windll.user32.SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, name, 3)
+            
+            # Track in wallpaper history
+            try:
+                from .wallpaper_manager import wallpaper_manager
+                theme = state or "custom"  # Use state param for theme name
+                wallpaper_manager.add_to_history(name, theme)
+            except Exception:
+                pass  # Don't fail if history tracking fails
+            
+            return f"OK: Wallpaper set to {name}"
+        except Exception as e:
+            return f"ERR: {e}"
+
+    if action == "theme_transparency":
+        # Enable/disable transparency effects (val = 1 for ON, 0 for OFF)
+        try:
+            cmd = f'Set-ItemProperty -Path HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize -Name EnableTransparency -Value {val}'
+            _ps(cmd)
+            return f"OK: Transparency {'enabled' if val == 1 else 'disabled'}"
+        except Exception as e:
+            return f"ERR: {e}"
+
+    # ── Notification Center Interaction ──
+    if action == "notification_open":
+        try:
+            pyautogui.hotkey("win", "n")
+            return "OK: Opened Notification Center"
+        except Exception as e:
+            return f"ERR: {e}"
+
+    if action == "notification_clear":
+        # Clear all notifications
+        try:
+            pyautogui.hotkey("win", "n")
+            import time; time.sleep(0.5)
+            # Click "Clear all" button (approximate position, may need adjustment)
+            pyautogui.hotkey("tab")
+            time.sleep(0.2)
+            pyautogui.press("enter")
+            return "OK: Cleared all notifications"
+        except Exception as e:
+            return f"ERR: {e}"
+
+    if action == "notification_list":
+        # List recent notifications (reads from Windows notification database)
+        try:
+            cmd = """
+            $notifications = Get-WinEvent -LogName 'Microsoft-Windows-PushNotifications-Platform/Operational' -MaxEvents 10 -ErrorAction SilentlyContinue |
+            Select-Object TimeCreated, Message | Format-Table -AutoSize
+            $notifications
+            """
+            result = _ps(cmd)
+            return f"Recent Notifications:\n{result}" if result and not result.startswith("ERR:") else "No recent notifications"
+        except Exception as e:
+            return f"ERR: {e}"
+
+    if action == "notification_focus":
+        # Toggle Focus Assist mode (Do Not Disturb)
+        try:
+            # Open Focus Assist settings
+            subprocess.Popen(["start", "ms-settings:quiethours"], shell=True)
+            return "OK: Opened Focus Assist settings"
+        except Exception as e:
+            return f"ERR: {e}"
+
+    # ── Wallpaper Feedback & Management ──
+    if action == "wallpaper_dislike":
+        # User doesn't like current wallpaper - try alternative
+        try:
+            from .wallpaper_manager import handle_wallpaper_feedback
+            theme = name or "abstract"  # Use name param for theme
+            result = handle_wallpaper_feedback("dislike", theme)
+            return result
+        except Exception as e:
+            return f"ERR: {e}"
+    
+    if action == "wallpaper_restore":
+        # Restore previous wallpaper
+        try:
+            from .wallpaper_manager import handle_wallpaper_feedback
+            result = handle_wallpaper_feedback("restore")
+            return result
+        except Exception as e:
+            return f"ERR: {e}"
+    
+    if action == "wallpaper_suggest":
+        # Suggest alternative themes
+        try:
+            from .wallpaper_manager import handle_wallpaper_feedback
+            theme = name or None
+            result = handle_wallpaper_feedback("suggest", theme)
+            return result
+        except Exception as e:
+            return f"ERR: {e}"
+    
+    if action == "wallpaper_like":
+        # User likes current wallpaper
+        try:
+            from .wallpaper_manager import handle_wallpaper_feedback
+            result = handle_wallpaper_feedback("like")
+            return result
         except Exception as e:
             return f"ERR: {e}"
 

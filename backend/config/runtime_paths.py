@@ -20,20 +20,22 @@ def runtime_path(env_name: str, default: Path) -> Path:
 
 
 def _get_default_data_dir() -> Path:
-    if getattr(sys, "frozen", False) or os.getenv("MAYA_USE_LOCALAPPDATA", "1") == "1":
+    # Strict isolation: Use LOCALAPPDATA only in packaged/frozen mode, or if explicitly requested.
+    # Dev mode will naturally fall back to PROJECT_ROOT / "data".
+    if getattr(sys, "frozen", False) or os.getenv("MAYA_USE_LOCALAPPDATA", "0") == "1":
         if os.name == "nt":
-            local_appdata = os.getenv("LOCALAPPDATA", "").strip()
-            if local_appdata:
-                return Path(local_appdata) / "MayaAI" / "data"
+            appdata = os.getenv("LOCALAPPDATA", "").strip()
+            if appdata:
+                return Path(appdata) / "MayaAI"
     return PROJECT_ROOT / "data"
 
 
 def _get_default_state_dir() -> Path:
     if getattr(sys, "frozen", False) or os.getenv("MAYA_USE_LOCALAPPDATA", "1") == "1":
         if os.name == "nt":
-            local_appdata = os.getenv("LOCALAPPDATA", "").strip()
-            if local_appdata:
-                return Path(local_appdata) / "MayaAI" / "state"
+            appdata = os.getenv("LOCALAPPDATA", "").strip()
+            if appdata:
+                return Path(appdata) / "MayaAI" / "state"
     return BACKEND_ROOT / "state"
 
 

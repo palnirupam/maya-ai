@@ -2,6 +2,7 @@ import logging
 from typing import AsyncGenerator
 
 from .edge_tts_adapter import EdgeTTSAdapter, detect_language
+from .kokoro_tts_adapter import KokoroTTSAdapter
 from ..providers.gpt_sovits_adapter import GPTSoVITSAdapter
 from ..providers.gemini_live_adapter import GeminiLiveAdapter
 from .elevenlabs import ElevenLabsAdapter
@@ -13,22 +14,19 @@ from backend.database.crypto import crypto_manager
 logger = logging.getLogger(__name__)
 
 
-# Valid TTS provider identifiers.
-_VALID_TTS_PROVIDERS = frozenset({"edge", "gemini", "elevenlabs", "gpt_sovits"})
-
-# Edge TTS is the default: zero-latency, zero-API-dependency, always available.
-# Users can switch to Gemini Native Audio / ElevenLabs / GPT-SoVITS from Settings.
+_VALID_TTS_PROVIDERS = frozenset({"edge", "gemini", "elevenlabs", "gpt_sovits", "kokoro"})
 _DEFAULT_TTS_PROVIDER = "edge"
 
 
 class TTSRouter:
     """
     Smart TTS router with graceful fallback chain:
-      Primary (user-configurable, default: Edge TTS)
+      Primary (user-configurable, default: Kokoro TTS)
         → Fallback: Edge TTS (always available, ~50ms latency)
 
     Provider options:
-      - 'edge'       : Microsoft Edge TTS — free, fast, offline-capable  [DEFAULT]
+      - 'edge'       : Microsoft Edge TTS — free, fast, Indian voices  [DEFAULT]
+      - 'edge'       : Microsoft Edge TTS — free, fast, always available
       - 'gemini'     : Gemini Native Audio — ultra-realistic, cloud-only
       - 'elevenlabs' : ElevenLabs / cvoice.ai — voice clone, cloud-only
       - 'gpt_sovits' : GPT-SoVITS — local offline voice clone
@@ -36,6 +34,7 @@ class TTSRouter:
 
     def __init__(self):
         self._edge = EdgeTTSAdapter()
+        self._kokoro = KokoroTTSAdapter()
         self._gpt_sovits = GPTSoVITSAdapter()
         self._elevenlabs = ElevenLabsAdapter()
         self._gemini = GeminiLiveAdapter()
@@ -54,7 +53,7 @@ class TTSRouter:
             pref = db.query(UserPreferences).filter(UserPreferences.key == "TTS_PRIMARY_PROVIDER").first()
             if pref and pref.value:
                 try:
-                    stored = crypto_manager.decrypt(pref.value).strip()
+                    stored = crypto_manager.decrypt(pref.value, raise_on_failure=True).strip()
                     # Accept any valid provider the user explicitly chose.
                     # Fall back to the default if the stored value is unrecognised.
                     if stored in _VALID_TTS_PROVIDERS:
@@ -92,10 +91,23 @@ class TTSRouter:
         if not clean_text:
             return
 
-        primary = getattr(self, "primary_provider", "gemini")
+        primary = getattr(self, "primary_provider", "kokoro")
 
-        # 1. Gemini Native Audio (default — ultra-realistic human-like voice)
-        if primary == "gemini":
+        # 0. Kokoro TTS (default primary — free, local, offline AI voice)
+        if primary == "kokoro":
+            try:
+                has_audio = False
+                async for chunk in self._kokoro.generate_audio_stream(clean_text, lang, emotion):
+                    has_audio = True
+                    yield chunk
+                if has_audio:
+                    return
+                logger.warning("Kokoro TTS yielded no audio — falling back to Edge TTS.")
+            except Exception as e:
+                logger.warning(f"Kokoro TTS stream error: {e}. Falling back to Edge TTS.")
+
+        # 1. Gemini Native Audio
+        elif primary == "gemini":
             try:
                 has_audio = False
                 async for chunk in self._gemini.generate_audio_stream(clean_text, lang, emotion):
@@ -120,7 +132,7 @@ class TTSRouter:
                 except Exception as e:
                     logger.warning(f"ElevenLabs stream failed: {e}. Falling back to Edge TTS.")
             else:
-                logger.warning("ElevenLabs primary selected but API key is missing. Falling back to Edge TTS.")
+                logger.warning("ElevenLabs selected but API key missing. Falling back to Edge TTS.")
 
         # 2. GPT-SoVITS
         elif primary == "gpt_sovits":

@@ -32,13 +32,16 @@ export type SessionState =
 const SILENCE_THRESHOLD_MS = 1500;
 
 /** Volume (0–255) above which we consider the user to be speaking */
-const SPEAKING_VOLUME_THRESHOLD = 18;
+const SPEAKING_VOLUME_THRESHOLD = 30;
 
 /** Volume threshold for INTERRUPT detection — higher to avoid false positives */
-const INTERRUPT_VOLUME_THRESHOLD = 40;
+const INTERRUPT_VOLUME_THRESHOLD = 50;
 
 /** Max WebSocket blob size in bytes — skip send if exceeded to prevent overflow */
 const MAX_BLOB_BYTES = 10 * 1024 * 1024; // 10 MB
+
+/** Hard cap on recording duration — prevents 1-min+ recordings that freeze Whisper */
+const MAX_RECORDING_MS = 25_000; // 25 seconds
 
 /** Delay before auto-resetting from SESSION_ERROR → SESSION_IDLE */
 const ERROR_RESET_DELAY_MS = 3000;
@@ -56,6 +59,7 @@ export const useVoiceSession = () => {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const maxRecordingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isRecordingRef = useRef(false);
   const isMayaSpeakingRef = useRef(false);
   const vadLoopRef = useRef<number | null>(null);
@@ -89,6 +93,13 @@ export const useVoiceSession = () => {
     }
   }, []);
 
+  const _clearMaxRecordingTimer = useCallback(() => {
+    if (maxRecordingTimerRef.current) {
+      clearTimeout(maxRecordingTimerRef.current);
+      maxRecordingTimerRef.current = null;
+    }
+  }, []);
+
   /** Stop and discard the current MediaRecorder without sending audio. */
   const _abortRecording = useCallback(() => {
     if (mediaRecorderRef.current && isRecordingRef.current) {
@@ -98,18 +109,20 @@ export const useVoiceSession = () => {
     }
     audioChunksRef.current = [];
     _clearSilenceTimer();
-  }, [_clearSilenceTimer]);
+    _clearMaxRecordingTimer();
+  }, [_clearSilenceTimer, _clearMaxRecordingTimer]);
 
   /** Finalize current recording and send blob over WebSocket. */
   const _finalizeAndSend = useCallback(() => {
     if (!mediaRecorderRef.current || !isRecordingRef.current) return;
     _clearSilenceTimer();
+    _clearMaxRecordingTimer();
 
     // onstop fires after .stop() — we send audio there
     mediaRecorderRef.current.stop();
     isRecordingRef.current = false;
     _setState('SENDING');
-  }, [_clearSilenceTimer, _setState]);
+  }, [_clearSilenceTimer, _clearMaxRecordingTimer, _setState]);
 
   /** Start a fresh MediaRecorder on the existing stream. */
   const _startRecorder = useCallback(() => {
@@ -148,7 +161,13 @@ export const useVoiceSession = () => {
 
     recorder.start();
     isRecordingRef.current = true;
-  }, [_setState]);
+
+    // Hard cap: auto-send after MAX_RECORDING_MS regardless of silence
+    maxRecordingTimerRef.current = setTimeout(() => {
+      console.warn('[VoiceSession] Max recording duration reached — auto-finalizing.');
+      if (isRecordingRef.current) _finalizeAndSend();
+    }, MAX_RECORDING_MS);
+  }, [_finalizeAndSend, _setState]);
 
   // ── VAD loop ────────────────────────────────────────────────────────────────
 
@@ -316,6 +335,7 @@ export const useVoiceSession = () => {
 
     // Clear timers
     _clearSilenceTimer();
+    _clearMaxRecordingTimer();
     if (errorResetTimerRef.current) {
       clearTimeout(errorResetTimerRef.current);
       errorResetTimerRef.current = null;
@@ -324,7 +344,7 @@ export const useVoiceSession = () => {
     isMayaSpeakingRef.current = false;
     setVolume(0);
     _setState('SESSION_IDLE');
-  }, [_abortRecording, _clearSilenceTimer, _setState]);
+  }, [_abortRecording, _clearSilenceTimer, _clearMaxRecordingTimer, _setState]);
 
   // Cleanup on unmount
   useEffect(() => {

@@ -22,11 +22,15 @@ LANGUAGE_STYLE_POLICY = (
     "(1) Banglish = Bangla grammar and phrasing in Latin letters, "
     "(2) Hindilish = Hindi grammar and phrasing in Latin letters, and "
     "(3) English = natural English. Detect the user's style and reply in that same "
-    "style. Never output Bengali or Devanagari script in a normal reply. Technical "
+    "style on every turn, including tool confirmations, errors, safety messages, "
+    "and fallback replies. Never output Bengali or Devanagari script in a normal reply. Technical "
     "English terms may stay unchanged inside Banglish or Hindilish. Keep the current "
     "conversation style for short or ambiguous follow-ups unless the user clearly "
     "switches styles or explicitly asks for another one."
 )
+
+_BENGALI_SCRIPT_RE = re.compile(r"[\u0980-\u09ff]")
+_DEVANAGARI_SCRIPT_RE = re.compile(r"[\u0900-\u097f]")
 
 _WORD_RE = re.compile(r"[a-z]+(?:'[a-z]+)?", re.IGNORECASE)
 
@@ -224,6 +228,38 @@ def response_style_directive(style: str) -> str:
     return (
         "RESPONSE STYLE (MANDATORY): ENGLISH. Reply in natural English; do not "
         "switch to Banglish or Hindilish."
+    )
+
+
+def response_matches_style(text: str, style: str) -> bool:
+    """Conservative production check for the three canonical output styles."""
+    raw = text or ""
+    if _BENGALI_SCRIPT_RE.search(raw) or _DEVANAGARI_SCRIPT_RE.search(raw):
+        return False
+    if style not in LANGUAGE_STYLES:
+        return False
+    if not raw.strip():
+        return True
+
+    detected = detect_language_style(raw)
+    if style == ENGLISH:
+        return detected == ENGLISH
+    if detected == style:
+        return True
+
+    tokens = [token.lower() for token in _WORD_RE.findall(raw)]
+    if style == BANGLISH:
+        return any(token in _BANGLISH_STRONG for token in tokens)
+    return any(token in _HINDILISH_STRONG for token in tokens)
+
+
+def style_repair_prompt(text: str, style: str) -> str:
+    """Prompt used only when a final model reply violates the locked turn style."""
+    return (
+        f"Rewrite the message below in the mandatory {style.upper()} response style. "
+        "Preserve every fact, number, path, error, and conclusion. Do not add or remove information. "
+        "Use only English/Latin letters and output only the rewritten message.\n\n"
+        f"Message:\n{text}"
     )
 
 
